@@ -1,5 +1,6 @@
 import * as Y from 'yjs';
 import { createContext, useContext, useEffect, useRef } from 'react';
+import { assertSandboxEnvironment } from '../sandbox.config.js';
 
 // The websocket endpoint has to be configured to be used. It was previously
 // read from `process.env.REACT_APP_WEBSOCKET_ENDPOINT` — a Create React App
@@ -22,14 +23,8 @@ import { createContext, useContext, useEffect, useRef } from 'react';
 // would reach `new WebsocketProvider()` and restart exactly the doomed backoff
 // loop described above. Setting this is only meaningful once a real y-websocket
 // server is actually reachable at the address.
-const RAW_ENDPOINT = (import.meta.env?.VITE_WEBSOCKET_ENDPOINT || '').trim();
-const ENDPOINT = /^wss?:\/\/./i.test(RAW_ENDPOINT) ? RAW_ENDPOINT : '';
-if (RAW_ENDPOINT && !ENDPOINT) {
-  // Never ignore a configured value in silence - say which value was discarded.
-  console.warn(
-    `[crdt] VITE_WEBSOCKET_ENDPOINT is set to a non-websocket value (${RAW_ENDPOINT}); realtime sync stays OFF. Expected ws:// or wss://.`
-  );
-}
+assertSandboxEnvironment(import.meta.env || {});
+const ENDPOINT = '';
 
 export const YDocContext = createContext(null);
 

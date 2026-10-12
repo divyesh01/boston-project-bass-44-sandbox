@@ -43,12 +43,15 @@
 //
 // Gated by scripts/probe-standalone-deploy.mjs.
 
+import { assertSandboxEnvironment } from './sandbox.config.js';
+
 export default function standaloneEnvGuard() {
   return {
     name: 'standalone-env-guard',
     apply: 'build',
 
     configResolved(config) {
+      assertSandboxEnvironment(config.env || {});
       if (config.mode !== 'production') return;
 
       const env = config.env || {};

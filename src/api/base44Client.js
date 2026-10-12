@@ -12,6 +12,7 @@ import { recalculationService } from '@/lib/recalculationService';
 import { isValidEmail, isValidUsername } from '@/lib/validator';
 import { validatePasswordStrength } from '@/lib/security';
 import { createClient } from '@base44/sdk';
+import { assertSandboxEnvironment } from '../../sandbox.config.js';
 import * as otplib from 'otplib';
 
 // ─── The CSRF pair, and why the header value has to be captured here ───
@@ -31,24 +32,9 @@ import * as otplib from 'otplib';
 // call.
 const CSRF_HEADER_TOKEN = getCsrfToken();
 
-// ─── The production tenant ───
-// NOT a development placeholder, despite reading like one. None of
-// .env.development, .env.local or .env.production sets VITE_BASE44_APP_ID, so
-// this literal is the actual configuration of every build this repo produces —
-// deleting it as a "hardcoded value" would break every deployment.
-//
-// It is also not a secret. It ships inside the JS bundle, travels as the
-// X-App-Id header on every request, and is duplicated in base44/.app.jsonc,
-// which is the file the base44 CLI deploys the functions against. The two must
-// stay equal or the client and its own backend address different tenants;
-// scripts/probe-app-config.mjs pins that equality.
-//
-// The environment variable still wins when set, and its absence stays
-// non-fatal on purpose: making an unset variable throw would brick production
-// on the next push, which is a far larger outage than the legibility problem it
-// would fix. The real hazard here is defaulting to the WRONG tenant silently,
-// so .env.example asks every environment to set it explicitly.
-const PRODUCTION_APP_ID = "6a7d6856ee1cc714b1803c0e";
+// AI sandbox only: fail closed before the SDK is initialized.
+// The expected app ID is pinned in sandbox.config.js. There is no production fallback.
+const SANDBOX_CONNECTION = assertSandboxEnvironment(import.meta.env || {});
 
 // ─── Refuse a bearer token that arrived in the URL ───
 // createClient() calls getAccessToken() while it is constructing
@@ -109,8 +95,7 @@ function refuseUrlSuppliedAccessToken() {
 refuseUrlSuppliedAccessToken();
 
 const realClient = createClient({
-  appId: import.meta.env?.VITE_BASE44_APP_ID || PRODUCTION_APP_ID,
-  serverUrl: import.meta.env?.VITE_BASE44_BACKEND_URL || "",
+  ...SANDBOX_CONNECTION,
   headers: {
     "X-CSRF-Token": CSRF_HEADER_TOKEN
   }

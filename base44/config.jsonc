@@ -1,5 +1,6 @@
 {
-  "name": "untitled",
+  "name": "boston-project-ai-sandbox",
+  "visibility": "private",
   "site": {
     "installCommand": "npm install",
     "buildCommand": "npm run build",
