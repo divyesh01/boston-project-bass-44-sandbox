@@ -1,0 +1,149 @@
+name: Bootstrap Base44 Sandbox
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bootstrap-sandbox.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sandbox
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone official Boston source (read-only)
+        run: |
+          git clone --depth 1 --branch main https://github.com/divyesh01/boston_project.git /tmp/boston-source
+          git -C /tmp/boston-source rev-parse HEAD > /tmp/source-sha
+
+      - name: Copy application into sandbox without production deployment wiring
+        shell: bash
+        run: |
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/workflows/' \
+            --exclude='AI_SANDBOX.md' \
+            --exclude='.gitignore' \
+            --exclude='.env.production' \
+            --exclude='.env.local' \
+            --exclude='.dev.vars' \
+            --exclude='.dev.vars.*' \
+            --exclude='wrangler.jsonc' \
+            --exclude='wrangler.api.jsonc' \
+            --exclude='wrangler.staging.jsonc' \
+            --exclude='vercel.json' \
+            /tmp/boston-source/ ./
+
+      - name: Install sandbox-only environment guardrails
+        shell: bash
+        run: |
+          cat > .env.development <<'EOF'
+          # BASE44 SANDBOX ONLY — intentionally disconnected from production cloud resources.
+          # Public Vite values only. Never put a secret in this file.
+          VITE_BASE44_APP_ID=sandbox-not-configured
+          VITE_BASE44_BACKEND_URL=
+          VITE_USE_LOCAL_AUTH=true
+          VITE_STANDALONE_LOCAL=false
+          VITE_USE_SERVER_AUTH=false
+          VITE_USE_D1_API=false
+          VITE_USE_SERVER_DATA_SYNC=false
+          VITE_WEBSOCKET_ENDPOINT=
+          EOF
+
+          cat > .env.production <<'EOF'
+          # BASE44 SANDBOX ONLY — deliberately does not point at the production tenant.
+          # This exists so a preview/build cannot silently fall back to Boston production config.
+          VITE_BASE44_APP_ID=sandbox-not-configured
+          VITE_BASE44_BACKEND_URL=
+          VITE_USE_LOCAL_AUTH=false
+          VITE_STANDALONE_LOCAL=false
+          VITE_USE_SERVER_AUTH=false
+          VITE_USE_D1_API=false
+          VITE_USE_SERVER_DATA_SYNC=false
+          VITE_WEBSOCKET_ENDPOINT=
+          EOF
+
+          mkdir -p sandbox-cloud-config
+          cat > sandbox-cloud-config/README.md <<'EOF'
+          # Production cloud configuration intentionally omitted
+
+          This sandbox does not contain the official project's live Cloudflare/Vercel deployment configuration.
+          The following production-oriented files are intentionally not copied from the official repository:
+
+          - `wrangler.jsonc`
+          - `wrangler.api.jsonc`
+          - `wrangler.staging.jsonc`
+          - `vercel.json`
+          - `.dev.vars*`
+          - the official `.env.production`
+
+          Base44 may edit application code here, but it must not attempt to discover, recreate, or connect to production credentials, D1 databases, R2 buckets, Workers, domains, or deployment secrets.
+          EOF
+
+          SOURCE_SHA="$(cat /tmp/source-sha)"
+          cat > SANDBOX_SOURCE.md <<EOF
+          # Sandbox source snapshot
+
+          This working copy was bootstrapped from:
+
+          - Official repository: \`divyesh01/boston_project\`
+          - Official branch: \`main\`
+          - Source commit: \`${SOURCE_SHA}\`
+
+          This repository is not the source of truth. AI-generated changes must be reviewed and selectively ported back to the official repository through its normal branch/PR/verification process.
+          EOF
+
+      - name: Add visible sandbox warning to README
+        shell: bash
+        run: |
+          if [ -f README.md ]; then
+            cp README.md /tmp/original-readme.md
+          else
+            : > /tmp/original-readme.md
+          fi
+          cat > README.md <<'EOF'
+          # ⚠️ Base44 AI Sandbox — NOT Production
+
+          This is a disposable, sanitized development copy of the Boston Project for AI experimentation. It has no authority over production and intentionally omits production cloud deployment wiring. See `AI_SANDBOX.md` before making changes.
+
+          ---
+
+          EOF
+          cat /tmp/original-readme.md >> README.md
+
+      - name: Refuse obvious committed secret files
+        shell: bash
+        run: |
+          bad=0
+          for p in .env.local .dev.vars credentials.json service-account.json; do
+            if [ -e "$p" ]; then
+              echo "Forbidden sandbox file present: $p"
+              bad=1
+            fi
+          done
+          if [ "$bad" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Commit sanitized snapshot
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          # These two are intentionally committed despite the generic env ignore rule.
+          git add -f .env.development .env.production
+          if git diff --cached --quiet; then
+            echo 'Sandbox already matches the sanitized source snapshot.'
+            exit 0
+          fi
+          git commit -m 'chore: bootstrap sanitized Boston snapshot for Base44'
+          git push origin HEAD:main
