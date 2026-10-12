@@ -1,0 +1,30 @@
+# Never commit secrets or local production credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+.dev.vars
+.dev.vars.*
+.wrangler/
+node_modules/
+dist/
+coverage/
+.DS_Store
+Thumbs.db
+
+# Local/cloud credential files
+.aws/
+.gcloud/
+.npmrc
+.netrc
+
+# Explicitly keep any sandbox-only examples safe
+*.secrets
+*.secret
+secrets.*
+credentials.*
