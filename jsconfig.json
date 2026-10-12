@@ -1,0 +1,89 @@
+{
+  // Type-checking configuration for `npm run typecheck` (tsc -p ./jsconfig.json).
+  // This is a JS project — `checkJs` means JSDoc annotations are load-bearing.
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+    "jsx": "react-jsx",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "target": "esnext",
+    "checkJs": true,
+
+    // EXPLICIT, and not redundant. TypeScript applies a jsconfig's *implied*
+    // noEmit only to a file named exactly "jsconfig.json". On 2026-08-21 a copy
+    // of this file under another name (jsconfig.wide.json) was used to measure
+    // coverage, and because the implied rule did not apply, that run EMITTED:
+    // it transpiled every in-scope .jsx into a sibling .js — 111 stray files,
+    // five of them compiled twins of PROTECTED_FILES.md entries. No TS5055
+    // guard fires, because the output filename differs from the input. Worse,
+    // Vite's default resolve.extensions puts ".js" BEFORE ".jsx", so each twin
+    // would have shadowed its own source for any extensionless import.
+    // Declaring it here means no invocation of any copy of this config can emit.
+    "noEmit": true,
+
+    "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "types": ["vite/client", "node", "vitest/globals", "@testing-library/jest-dom/vitest"],
+    "maxNodeModuleJsDepth": 0
+  },
+
+  // WIDENED 2026-08-21. This was previously an enumerated list of directories
+  // (src/components, src/pages, src/lib, src/types, src/Layout.jsx), which meant
+  // the gate silently skipped src/api — including the 2283-line base44Client.js
+  // that every entity read and write goes through — plus src/hooks, src/utils,
+  // src/tests, and App.jsx / main.jsx / crdt.jsx / test-setup.js at the src root.
+  // A glob cannot develop that kind of gap as the tree grows.
+  // Measured: 185 files -> 201 files in the program, 0 errors, nothing dropped.
+  //
+  // EXTENDED 2026-08-30: `worker/**/*.js` added so the off-production Cloudflare
+  // Worker backend (worker/index.js) is type-checked under the same checkJs gate
+  // as src/. It is a distinct runtime (Cloudflare Workers) but is authored in
+  // plain JS with JSDoc and MUST NOT import from src/, so no browser/Node type
+  // conflict arises; dom lib already supplies Request/Response/URL.
+  "include": ["src/**/*.js", "src/**/*.jsx", "worker/**/*.js"],
+
+  // Every exclusion is a factual statement with a measured cost, so that a
+  // future reader can re-decide rather than guess at the intent.
+  "exclude": [
+    "node_modules",
+    "dist",
+
+    // Vite plugin code runs in the build, not the app, and is authored against
+    // Node + Rollup types this config does not load.
+    "src/vite-plugins",
+
+    // Vendored shadcn/ui primitives. Costs 4 errors, all TS2339 from Radix
+    // union narrowing in toggle-group.jsx. Patching vendored files to satisfy a
+    // type checker makes the next upstream sync harder for no runtime benefit.
+    // Anything of ours that *uses* these components is still checked.
+    "src/components/ui"
+  ]
+
+  // Deliberately NOT included, with reasons:
+  //   **/*.ts              — the `include` globs above end in .js/.jsx, so NO
+  //                          TypeScript file is in this program: not
+  //                          src/utils/index.ts, not base44/.types/types.d.ts,
+  //                          not the 7 base44 function entry.ts files. eslint
+  //                          ignores them too (see eslint.config.js), so those 9
+  //                          files have no automated gate at all. Recorded here
+  //                          because eslint.config.js used to point at this file
+  //                          as their gate, which was false. A per-file
+  //                          `tsc --noEmit --noResolve` run does work on them:
+  //                          base44/functions/autoPayroll/entry.ts measured 3
+  //                          errors, all TS2307 on Deno specifiers, 2026-08-24.
+  //   scripts/**            — 239 errors. These are Node harnesses, not app
+  //                           code; eslint is the correct gate for them.
+  //   backend/**, base44/** — 21 errors, nearly all TS2307 against Deno-style
+  //                           specifiers ("npm:@base44/sdk@^0.8.41",
+  //                           "base44:runtime", "npm:zod") that tsc can never
+  //                           resolve. Excluding them is honest; adding shims
+  //                           to fake resolution would be checking a fiction.
+}

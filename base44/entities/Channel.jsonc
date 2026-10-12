@@ -1,0 +1,125 @@
+{
+  "name": "Channel",
+  "type": "object",
+  "properties": {
+    "property_id": {
+      "type": "string"
+    },
+    "property_name": {
+      "type": "string"
+    },
+    "channel_name": {
+      "type": "string"
+    },
+    "channel_type": {
+      "type": "string",
+      "enum": [
+        "ota",
+        "direct",
+        "walk_in",
+        "corporate",
+        "other"
+      ],
+      "default": "other"
+    },
+    "commission_type": {
+      "type": "string",
+      "enum": [
+        "percentage",
+        "fixed",
+        "actual",
+        "none"
+      ],
+      "default": "none"
+    },
+    "commission_rate": {
+      "type": "number"
+    },
+    "commission_amount": {
+      "type": "number"
+    },
+    "gross_revenue": {
+      "type": "number"
+    },
+    "net_revenue": {
+      "type": "number"
+    },
+    "commission_status": {
+      "type": "string",
+      "enum": [
+        "configured",
+        "not_configured",
+        "actual"
+      ],
+      "default": "not_configured"
+    },
+    "date": {
+      "type": "string",
+      "format": "date"
+    },
+    "stays": {
+      "type": "number"
+    }
+  },
+  "required": [
+    "channel_name"
+  ],
+  "rls": {
+    "read": {
+      "$and": [
+        {
+          "user_condition": {
+            "is_active": true
+          }
+        },
+        {
+          "$or": [
+            {
+              "user_condition": {
+                "role": "admin"
+              }
+            },
+            {
+              "user_condition": {
+                "role": "owner"
+              }
+            },
+            {
+              "data.property_id": {
+                "$in": "{{user.property_access}}"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "write": {
+      "$and": [
+        {
+          "user_condition": {
+            "is_active": true
+          }
+        },
+        {
+          "$or": [
+            {
+              "user_condition": {
+                "role": "admin"
+              }
+            },
+            {
+              "user_condition": {
+                "role": "owner"
+              }
+            },
+            {
+              "data.property_id": {
+                "$in": "{{user.property_access}}"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

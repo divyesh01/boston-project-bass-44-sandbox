@@ -1,0 +1,506 @@
+import { readHotelDataRows } from '@/lib/hotelDataQuery';
+// Materialized daily financial aggregates.
+//
+// The Dashboard turns four daily ledgers (occupancy / source / gross / payment)
+// plus expenses into its headline metrics via CalculationService. At scale that
+// means scanning tens of thousands of raw rows every time a metric view opens.
+//
+// This module pre-computes, on every import, one row per (property_id,
+// business_date) carrying the additive daily totals (and the few per-day derived
+// figures the charts read). The Dashboard reconstructs synthetic per-day rows
+// from the cache and feeds them to the same renderers — the math is identical
+// (the service only sums across rows), but it reads a few hundred pre-summed
+// rows instead of the raw ledger. The raw rows remain the source of truth; this
+// cache is recomputed, never edited by hand.
+import { db } from '@/api/base44Client';
+import localDb from '@/api/localDb';
+import { CARD_METHODS } from '@/lib/paymentNorm';
+import { toCents, fromCents } from '@/lib/decimal';
+
+// Stored aggregates are a materialized cache, not the source of truth. Version
+// the cache whenever its units or shape change so an old browser cannot render a
+// cents-valued source_net as dollars and turn a normal commission into a six-figure
+// deduction. The raw ledgers remain available as the honest fallback.
+export const DAILY_AGGREGATE_VERSION = 4;
+
+const PAYMENT_FIELDS = [
+  ...CARD_METHODS, 'cash', 'check', 'direct_bill', 'corpay', 'wire_transfer',
+  'loyalty_certificate', 'loyalty_discount', 'vip_pass', 'other', 'closed_balance_folio',
+];
+
+// Per-day misc charge columns on GrossRevenueDay that the misc-charges breakdown
+// reads. Carried through so that panel works off the cache too.
+const GROSS_MISC_FIELDS = [
+  'misc_charge', 'system_charge', 'food', 'event', 'bar', 'laundry', 'phone', 'other', 'beverage',
+];
+
+function inRange(dateStr, from, to) {
+  if (!dateStr) return false;
+  const d = String(dateStr).slice(0, 10);
+  if (from && d < from) return false;
+  if (to && d > to) return false;
+  return true;
+}
+
+// The date column differs per ledger, and the index is named after it, so the
+// bound has to be attached under the right key or planQuery has nothing to plan.
+const LEDGER_DATE_FIELD = {
+  OccupancyDay: 'date',
+  SourceDay: 'date',
+  GrossRevenueDay: 'date',
+  PaymentDay: 'date',
+  Expense: 'expense_date',
+};
+
+/**
+ * A date range expressed as a query condition, so the read is narrowed by an
+ * index instead of by discarding rows afterwards.
+ *
+ * planQuery() in base44Client.js turns `{ property_id: 'X', date: {$gte,$lte} }`
+ * into `[property_id+date].between(...)` and a bare `{ date: {$gte,$lte} }` into
+ * `date.between(...)`; both indexes are declared (localDb v14 for the ledgers,
+ * v20 for the aggregate cache). With no condition to plan it reads the table, so
+ * a one-month view used to materialize every row the property has ever had and
+ * then throw almost all of them away.
+ *
+ * The upper bound is padded because these columns are not guaranteed to be
+ * date-only — `ensure()` below slices ten characters off them for exactly that
+ * reason. A stored '2026-08-31T23:30:00Z' sorts ABOVE '2026-08-31', so an
+ * unpadded between() would silently drop that day. U+FFFF sorts above every
+ * character a timestamp suffix can begin with, which makes the index range a
+ * strict superset of what inRange() accepts — and inRange() still runs on the
+ * result, so the rows returned are identical either way. Narrowing must never be
+ * the thing that decides which rows exist.
+ *
+ * Exported for scripts/probe-ledger-index.mjs, which asserts that superset
+ * property directly rather than trusting the argument above.
+ *
+ * @param {string} from inclusive lower bound, 'YYYY-MM-DD' (empty = unbounded)
+ * @param {string} to inclusive upper bound, 'YYYY-MM-DD' (empty = unbounded)
+ * @returns {{$gte?: string, $lte?: string} | null} null when neither bound is set
+ */
+export function dateBound(from, to) {
+  const cond = {};
+  if (from) cond.$gte = String(from).slice(0, 10);
+  if (to) cond.$lte = `${String(to).slice(0, 10)}\uffff`;
+  return Object.keys(cond).length ? cond : null;
+}
+
+async function fetchLedger(name, propertyId, from, to) {
+  const query = {};
+  const field = LEDGER_DATE_FIELD[name];
+  const bound = field ? dateBound(from, to) : null;
+  if (bound) query[field] = bound;
+
+  let rows;
+  if (propertyId != null && propertyId !== '' && propertyId !== 'all') {
+    query.property_id = Array.isArray(propertyId) ? { $in: propertyId } : propertyId;
+    rows = await readHotelDataRows(db.entities[name], query);
+  } else {
+    // No 200000 cap. list() sorted by -created_date and then sliced, so once a
+    // table passed that many rows the OLDEST rows fell out of the rebuild — and
+    // because the Dashboard prefers this cache over the live ledgers, the days it
+    // dropped would have shown as revenue that quietly went missing. The cap
+    // never bounded memory either: the proxy materializes the whole table before
+    // slicing it.
+    rows = await readHotelDataRows(db.entities[name], query, '-created_date');
+  }
+  return rows.filter((r) => inRange(r.date || r.business_date || r.expense_date, from, to));
+}
+
+/**
+ * One in-progress day bucket. Every MONEY field holds integer CENTS while it is
+ * being accumulated; counts (`occ_rooms_sold`, `occ_capacity_rooms`, `stays`) hold
+ * plain integers, which are already exact in floating point. `finalizeDay`
+ * converts the money back to dollars once, at the end.
+ *
+ * @typedef {Object} DayAccumulator
+ * @property {string} property_id
+ * @property {string} business_date
+ * @property {number} occ_revenue cents
+ * @property {number} occ_rooms_sold count
+ * @property {number} occ_capacity_rooms count
+ * @property {number} occ_out_of_order
+ * @property {{occupancy:boolean,revenue:boolean,payment:boolean}} ledger_presence
+ * @property {Record<string, { net: number, stays: number, refunds?:number }>} source_net net in cents
+ * @property {number} gross_state_tax cents
+ * @property {number} gross_city_tax cents
+ * @property {number} gross_other_tax cents
+ * @property {boolean} gross_tax_fields_present
+ * @property {number} gross_room_rent cents
+ * @property {Record<string, number>} gross_misc cents
+ * @property {Record<string, number>} payment cents
+ * @property {number} payment_total cents
+ * @property {Record<string, number>} expense_by_category cents
+ */
+
+/**
+ * WHY THIS ACCUMULATES IN CENTS (2026-08-20)
+ * ───────────────────────────────────────────────────────────────────────────────
+ * Every field below used to be `+=` on a dollar value. That is not a rounding
+ * nicety here: getDailyAggregates() below is PREFERRED by the Dashboard over the
+ * live ledgers, and it falls back to the raw rows only when the cache is empty. So
+ * a float residue did not merely make one number slightly wrong — it made the
+ * cached path and the live path return different totals for the SAME period, which
+ * is precisely the invariant CLAUDE.md requires to hold exactly ("must match
+ * across all pages"). Whether the owner happened to look before or after an import
+ * decided which of the two figures they saw, and no row could be blamed for the
+ * difference.
+ *
+ * @returns {DayAccumulator}
+ */
+function newDay(pid, date) {
+  return {
+    property_id: pid,
+    business_date: date,
+    occ_revenue: 0, occ_rooms_sold: 0, occ_capacity_rooms: 0, occ_out_of_order:0,
+    source_net: Object.create(null), gross_state_tax: 0, gross_city_tax: 0, gross_other_tax: 0, gross_room_rent: 0, gross_tax_fields_present:false, gross_misc: {},
+    ledger_presence: {occupancy:false,revenue:false,payment:false},
+    payment: {}, payment_total: 0, expense_by_category: {},
+  };
+}
+
+/**
+ * Convert one accumulated day into the record that gets stored — money back to
+ * dollars, counts untouched.
+ *
+ * The stored shape is unchanged (dollars), deliberately: buildSyntheticRows() and
+ * every renderer downstream read these fields as dollars, and rows already sitting
+ * in a user's IndexedDB from a previous build are dollars too. Changing the stored
+ * unit would silently multiply every historical cached day by 100.
+ *
+ * BEST OUTCOME NOTE (2026-08-20): this is built key-by-key rather than by spreading
+ * the accumulator and converting a list of known money keys. The two choices fail
+ * in opposite directions. Key-by-key means a money field added to newDay and
+ * forgotten here is simply ABSENT from the cache — a consumer reads 0 and a probe
+ * that compares cached totals against the live ledger catches it. Spread-and-
+ * convert means a forgotten field is stored in CENTS and rendered as a dollar
+ * figure 100x too large, which looks like real revenue. Preferring the loud
+ * failure is the point.
+ *
+ * @param {DayAccumulator} d
+ */
+function finalizeDay(d) {
+  /** @param {Record<string, number>} obj */
+  const centsToDollars = (obj) => {
+    /** @type {Record<string, number>} */
+    const out = {};
+    for (const [k, v] of Object.entries(obj || {})) out[k] = fromCents(v);
+    return out;
+  };
+  /** @type {Record<string, { net: number, stays: number, refunds?:number }>} */
+  const sourceNet = Object.create(null);
+  for (const [k, v] of Object.entries(d.source_net || {})) {
+    sourceNet[k] = { net: fromCents(v.net), stays: v.stays, refunds:fromCents(v.refunds || 0) };
+  }
+  return {
+    ledger_presence: d.ledger_presence,
+    aggregate_version: DAILY_AGGREGATE_VERSION,
+    property_id: d.property_id,
+    business_date: d.business_date,
+    occ_revenue: fromCents(d.occ_revenue),
+    occ_rooms_sold: d.occ_rooms_sold,
+    occ_capacity_rooms: d.occ_capacity_rooms,
+    occ_out_of_order: d.occ_out_of_order,
+    source_net: sourceNet,
+    gross_state_tax: fromCents(d.gross_state_tax),
+    gross_city_tax: fromCents(d.gross_city_tax),
+    gross_other_tax: fromCents(d.gross_other_tax),
+    gross_room_rent: fromCents(d.gross_room_rent),
+    gross_tax_fields_present:d.gross_tax_fields_present,
+    gross_misc: centsToDollars(d.gross_misc),
+    payment: centsToDollars(d.payment),
+    payment_total: fromCents(d.payment_total),
+    expense_by_category: centsToDollars(d.expense_by_category),
+  };
+}
+
+/**
+ * Roll five raw ledgers into finalized (dollars) day records. Pure — no database,
+ * no auth, no clock.
+ *
+ * Exported and kept separate from rebuildDailyAggregates for the same reason
+ * src/lib/auditView.js exists: this is the arithmetic the Dashboard's preferred
+ * read path depends on, and while it lived inside the async DB function the only
+ * way to test it was to stand up fake-indexeddb, seed five entities and read the
+ * cache back — so in practice it was never tested at all. Now
+ * scripts/probe-decimal-integration.mjs can feed it the same rows it feeds
+ * CalculationService and assert the two agree to the cent, which is the invariant
+ * that actually matters.
+ *
+ * @param {{ occ?: any[], src?: any[], gross?: any[], pay?: any[], exp?: any[] }} ledgers
+ */
+export function aggregateDays({ occ = [], src = [], gross = [], pay = [], exp = [] } = {}) {
+  /** @type {Map<string, DayAccumulator>} */
+  const byDay = new Map();
+  const ensure = (pid, date) => {
+    const key = `${pid}|${date}`;
+    let day = byDay.get(key);
+    if (!day) {
+      day = newDay(pid, date);
+      byDay.set(key, day);
+    }
+    return day;
+  };
+
+  for (const r of occ) {
+    const d = ensure(r.property_id, String(r.date).slice(0, 10));
+    d.ledger_presence.occupancy = true;
+    d.occ_revenue += toCents(r.room_revenue);
+    d.occ_rooms_sold += Number(r.rooms_sold) || 0;
+    d.occ_out_of_order += Number(r.out_of_order ?? r.down_rooms ?? r.ooo_rooms ?? 0);
+    d.occ_capacity_rooms += Number(r.total_rooms) || 0;
+  }
+
+  for (const r of src) {
+    const date = String(r.date).slice(0, 10);
+    const d = ensure(r.property_id, date);
+    const key = r.source || r.code || 'UNKNOWN';
+    const cur = d.source_net[key] || { net: 0, stays: 0, refunds:0 };
+    cur.refunds += toCents(r.refunds || r.refund_amount || 0);
+    cur.net += toCents(r.net_revenue);
+    cur.stays += Number(r.stays) || 0;
+    d.source_net[key] = cur;
+  }
+
+  for (const r of gross) {
+    const d = ensure(r.property_id, String(r.date).slice(0, 10));
+    d.ledger_presence.revenue = true;
+    d.gross_tax_fields_present ||= ["state_tax","city_tax","other_tax"].some(key=>r[key]!=null);
+    d.gross_state_tax += toCents(r.state_tax);
+    d.gross_city_tax += toCents(r.city_tax);
+    d.gross_other_tax += toCents(r.other_tax);
+    d.gross_room_rent += toCents(r.room_rent);
+    for (const f of GROSS_MISC_FIELDS) {
+      d.gross_misc[f] = (d.gross_misc[f] || 0) + toCents(r[f]);
+    }
+  }
+
+  for (const r of pay) {
+    const d = ensure(r.property_id, String(r.date).slice(0, 10));
+    d.ledger_presence.payment = true;
+    for (const f of PAYMENT_FIELDS) {
+      d.payment[f] = (d.payment[f] || 0) + toCents(r[f]);
+    }
+    d.payment_total += toCents(r.total);
+  }
+
+  for (const r of exp) {
+    const d = ensure(r.property_id, String(r.expense_date).slice(0, 10));
+    const cat = r.category || 'other';
+    d.expense_by_category[cat] = (d.expense_by_category[cat] || 0) + toCents(r.amount);
+  }
+
+  return [...byDay.values()].map(finalizeDay);
+}
+
+// Recompute every (property_id, business_date) aggregate for the given scope and
+// upsert into localDb.DailyFinancialAggregate. Idempotent: re-running for the
+// same days overwrites them. Returns the number of day-rows written.
+export async function rebuildDailyAggregates({ propertyId = 'all', from = '', to = '' } = {}) {
+  // Concurrent readers join the same synchronization promise. Sequential
+  // reads could exceed the freshness window and download every bundle again.
+  const [occ, src, gross, pay, exp] = await Promise.all([
+    fetchLedger('OccupancyDay', propertyId, from, to),
+    fetchLedger('SourceDay', propertyId, from, to),
+    fetchLedger('GrossRevenueDay', propertyId, from, to),
+    fetchLedger('PaymentDay', propertyId, from, to),
+    fetchLedger('Expense', propertyId, from, to),
+  ]);
+
+  const days = aggregateDays({ occ, src, gross, pay, exp });
+
+  let written = 0;
+  await localDb.transaction('rw', localDb.DailyFinancialAggregate, async () => {
+    if (!days.length) return;
+    // One indexed read and one batch write, instead of two awaited IndexedDB
+    // requests for every historical day. Retain existing IDs and extra fields.
+    const existing = await localDb.DailyFinancialAggregate
+      .where('[property_id+business_date]')
+      .anyOf(days.map(agg => [agg.property_id, agg.business_date])).toArray();
+    const key = agg => JSON.stringify([agg.property_id, agg.business_date]);
+    const byDay = new Map();
+    for (const row of existing) if (!byDay.has(key(row))) byDay.set(key(row), row);
+    await localDb.DailyFinancialAggregate.bulkPut(days.map(agg => ({ ...byDay.get(key(agg)), ...agg })));
+    written = days.length;
+  });
+
+  return { written, days: days.length };
+}
+
+// Read cached aggregates for a date range. Returns [] if the cache is empty
+// (e.g. never built yet) so callers can fall back to live computation.
+/**
+ * @param {{ propertyId?: string | string[]; from?: string; to?: string }} [opts]
+ */
+export async function getDailyAggregates({ propertyId = 'all', from = '', to = '' } = {}) {
+  // Read through db.entities, NOT the raw Dexie table. The proxy is what turns
+  // `propertyId: 'all'` into "every property this account may see" rather than
+  // "every property in the database", and what intersects an explicit list with
+  // the caller's allowance instead of trusting it.
+  //
+  // This matters more than it looks: rebuildDailyAggregates() runs on every
+  // import and the Dashboard PREFERS this cache over the live ledgers, falling
+  // back only when it is empty. Reading raw here meant the numbers most people
+  // look at first were the only ones with no property scoping at all.
+  //
+  // (rebuildDailyAggregates' writes above stay on raw localDb on purpose — they
+  // run inside a localDb.transaction zone, and a proxy write there would await
+  // the authorization lookup and kill the zone. See B6.)
+  const query = {};
+  if (propertyId != null && propertyId !== '' && propertyId !== 'all') {
+    query.property_id = Array.isArray(propertyId) ? { $in: propertyId } : propertyId;
+  }
+  // The date range belongs in the query, not in a .filter() afterwards. This is
+  // the read the Dashboard makes on every metric view, and it used to materialize
+  // every day the property had ever recorded in order to render one month of them.
+  // With a single property selected planQuery() drives
+  // [property_id+business_date].between(); with a list or the whole portfolio it
+  // falls back to property_id.anyOf() / a scan, because `business_date` is not in
+  // its single-field driver list — the cache is one row per property-day, so that
+  // fallback reads hundreds of rows rather than the ledgers' tens of thousands.
+  const bound = dateBound(from, to);
+  if (bound) query.business_date = bound;
+  const rows = await readHotelDataRows(db.entities.DailyFinancialAggregate, query, 'business_date');
+  // Rows written before DAILY_AGGREGATE_VERSION used a different money-unit
+  // contract. Do not guess whether a legacy row is dollars or cents: ignore it so
+  // the caller falls back to raw ledgers. Guessing here is how the dashboard can
+  // display an impossible commission larger than total revenue.
+  const selectedRows = rows.filter((r) => inRange(r.business_date, from, to));
+  if (selectedRows.some((r) => r.aggregate_version !== DAILY_AGGREGATE_VERSION)) return [];
+  return selectedRows;
+}
+
+// Turn cached aggregates back into the synthetic per-day row shape the Dashboard
+// and CalculationService expect, so no renderer math has to change. Supports both
+// client Dexie DailyFinancialAggregate and server-authoritative PropertyDaySummary.
+export function buildSyntheticRows(aggregates) {
+  const occRows = [];
+  const srcRows = [];
+  const grossRows = [];
+  const payRows = [];
+  const expenseRows = [];
+
+  for (const a of aggregates) {
+    const date = String(a.business_date).slice(0, 10);
+    let meta = null;
+    try {meta=(typeof a.channel_summary_json==='string' ? JSON.parse(a.channel_summary_json) : a.channel_summary_json)?._meta || null;} catch { /* Raw ledgers remain available for invalid summaries. */ }
+    const roomsSold = Number(a.rooms_sold ?? a.occ_rooms_sold ?? 0);
+    const capacity = Number(a.available_rooms ?? a.occ_capacity_rooms ?? 0);
+    const revenue = a.room_revenue_cents != null
+      ? a.room_revenue_cents / 100
+      : (a.occ_revenue || a.room_revenue || 0);
+    const occ = capacity > 0 ? roomsSold / capacity : (a.occupancy_rate || 0);
+    const adr = roomsSold > 0 ? revenue / roomsSold : (a.adr_cents ? a.adr_cents / 100 : 0);
+    const revpar = capacity > 0 ? revenue / capacity : (a.revpar_cents ? a.revpar_cents / 100 : 0);
+
+    if (a.ledger_presence?.occupancy || revenue || roomsSold || capacity) {
+      occRows.push({
+        property_id: a.property_id,
+        date,
+        room_revenue: revenue,
+        rooms_sold: roomsSold,
+        total_rooms: capacity,
+        out_of_order:a.occ_out_of_order ?? meta?.out_of_order ?? 0,
+        occupancy: occ,
+        adr,
+        revpar,
+      });
+    }
+
+    // Support source_net map or channel_summary_json string/object with structured _meta (R06)
+    let channelMap = a.source_net;
+    if (a.channel_summary_json) {
+      try {
+        const parsed = typeof a.channel_summary_json === "string" ? JSON.parse(a.channel_summary_json) : a.channel_summary_json;
+        if (parsed && typeof parsed === "object") {
+          meta = parsed._meta || null;
+          if (!channelMap) {
+            channelMap = Object.create(null);
+            if (meta?.channelsWithStays && typeof meta.channelsWithStays === "object") {
+              for (const [ch, info] of Object.entries(meta.channelsWithStays)) {
+                channelMap[ch] = {
+                  net: typeof info.net === "number" ? fromCents(info.net) : (info.net || 0),
+                  stays: Number(info.stays) || 0,
+                  refunds:fromCents(info.refunds || 0),
+                };
+              }
+            } else {
+              for (const [k, v] of Object.entries(parsed)) {
+                if (k === "_meta") continue;
+                channelMap[k] = {
+                  net: typeof v === "number" ? fromCents(v) : (v?.net || 0),
+                  stays: v?.stays || 0,
+                };
+              }
+            }
+          }
+        }
+      } catch {
+        channelMap = null;
+      }
+    }
+
+    if (channelMap) {
+      for (const [key, v] of Object.entries(channelMap)) {
+        if (v && typeof v === "object") {
+          srcRows.push({ property_id: a.property_id, date, source: key, code: key, net_revenue: v.net, stays: v.stays, refunds:v.refunds || 0 });
+        }
+      }
+    }
+
+    const roomRent = a.gross_room_rent ?? (meta?.gross_room_rent_cents != null ? fromCents(meta.gross_room_rent_cents) : (a.room_revenue_cents != null ? fromCents(a.room_revenue_cents) : 0));
+    const miscTotal = a.ancillary_revenue_cents ? fromCents(a.ancillary_revenue_cents) : 0;
+    const stateTax = a.gross_state_tax ?? (meta?.taxes?.state_tax_cents != null ? fromCents(meta.taxes.state_tax_cents) : 0);
+    const cityTax = a.gross_city_tax ?? (meta?.taxes?.city_tax_cents != null ? fromCents(meta.taxes.city_tax_cents) : 0);
+    const otherTax = a.gross_other_tax ?? (meta?.taxes?.other_tax_cents != null ? fromCents(meta.taxes.other_tax_cents) : 0);
+    const food = a.gross_misc?.food ?? (meta?.ancillary?.food_cents != null ? fromCents(meta.ancillary.food_cents) : 0);
+    const bar = a.gross_misc?.bar ?? (meta?.ancillary?.bar_cents != null ? fromCents(meta.ancillary.bar_cents) : 0);
+    const miscCharge = a.gross_misc?.misc_charge ?? (meta?.ancillary?.misc_charge_cents != null ? fromCents(meta.ancillary.misc_charge_cents) : (meta?.ancillary?.misc_cents != null ? fromCents(meta.ancillary.misc_cents) : (meta?.ancillary ? 0 : miscTotal)));
+
+    if (a.ledger_presence?.revenue || meta?.coverage?.includes('revenue') || meta?.tax_fields_present || a.gross_tax_fields_present || roomRent || miscTotal || stateTax || cityTax || otherTax || (a.gross_misc && Object.values(a.gross_misc).some((x) => x))) {
+      const g = {
+        property_id: a.property_id,
+        date,
+        room_rent: roomRent,
+        tax_fields_present:a.gross_tax_fields_present ?? meta?.tax_fields_present ?? (stateTax+cityTax+otherTax!==0),
+        state_tax: stateTax,
+        city_tax: cityTax,
+        other_tax: otherTax,
+        misc_charge: miscCharge,
+        food,
+        bar,
+      };
+      for (const f of GROSS_MISC_FIELDS) {
+        if (g[f] === undefined) {
+          g[f] = a.gross_misc?.[f] ?? (meta?.ancillary?.[f + "_cents"] != null ? fromCents(meta.ancillary[f + "_cents"]) : 0);
+        }
+      }
+      grossRows.push(g);
+    }
+
+    const payTotal = a.payment_total ?? (a.payment_total_cents != null ? fromCents(a.payment_total_cents) : 0);
+    const hasPayMeta = Boolean(meta?.payments && Object.keys(meta.payments).length > 0);
+    if (payTotal || (a.payment && Object.keys(a.payment).length) || hasPayMeta) {
+      const pay = { property_id: a.property_id, date, total: payTotal };
+      for (const f of PAYMENT_FIELDS) {
+        if (a.payment?.[f] != null) {
+          pay[f] = a.payment[f];
+        } else if (meta?.payments?.[f] != null) {
+          pay[f] = fromCents(meta.payments[f]);
+        } else {
+          pay[f] = 0;
+        }
+      }
+      payRows.push(pay);
+    }
+
+    if (a.expense_by_category) {
+      for (const [cat, amt] of Object.entries(a.expense_by_category)) {
+        if (amt) expenseRows.push({ property_id: a.property_id, expense_date: date, category: cat, amount: amt });
+      }
+    }
+  }
+
+  return { occRows, srcRows, grossRows, payRows, expenseRows };
+}

@@ -1,0 +1,374 @@
+import React, { useMemo, useState, useRef } from "react";
+import { DollarSign, Percent, TrendingDown, TrendingUp, FileDown, Lightbulb, Plus, Trash2 } from "lucide-react";
+import KpiCard from "@/components/ui-exec/KpiCard";
+import Card from "@/components/ui-exec/Card";
+import PaymentMethodChart from "@/components/dashboard/PaymentMethodChart";
+import { useSources, usePaymentData } from "@/lib/useHotelData";
+import { useGlobalFilters } from "@/lib/useGlobalFilters";
+import { usePullToRefresh } from "@/hooks/usePullToRefresh";
+import { exportToPdf } from "@/lib/pdfExport";
+import { C, money, money2, pct, num, inRange } from "@/lib/hotel";
+import { CalculationService } from "@/lib/calculationService";
+import { sumCents, fromCents } from "@/lib/decimal";
+import { getCommissionRates, setCommissionRates, getCcFeeRate, setCcFeeRate, COMMISSION_TYPES } from "@/lib/commissionRates";
+import { calculateOtaDependence, calculateDirectShiftOpportunity, CHANNEL_GROUPS } from "@/lib/channelDictionary";
+import { ErrorState, LoadingState } from "@/components/ui/status";
+import { useSettingsVersion } from "@/hooks/useSettingsVersion";
+import { useEffect } from "react";
+
+// Shown when localStorage refuses a write. The typed value is deliberately left
+// in the input rather than snapped back: updateRate fires on every keystroke, so
+// reverting would make the field impossible to type in. The wording therefore has
+// to carry the whole message — that what is on screen is NOT what is being
+// applied, and that it will not survive a reload.
+const WRITE_REFUSED =
+  "The browser refused to store this change, so the previous rate is still being used for every commission and fee figure on this page, and this edit will be gone when you reload. Storage may be full, or this window may be in private browsing — the browser console names the key that failed.";
+
+export default function OtaChannels() {
+  const { dateRange, property, months } = useGlobalFilters();
+  const settingsVersion = useSettingsVersion();
+  const sourcesQ = useSources(dateRange, property, months);
+  const payQ = usePaymentData(dateRange, property, months);
+  const { data: sources = [], refetch } = sourcesQ;
+  const { data: payRows = [], refetch: refPay } = payQ;
+  const [rates, setRates] = useState(() => getCommissionRates(property || "*"));
+  const [ccFee, setCcFee] = useState(() => getCcFeeRate(property || "*"));
+
+  useEffect(() => {
+    setRates(getCommissionRates(property || "*"));
+    setCcFee(getCcFeeRate(property || "*"));
+  }, [settingsVersion, property]);
+
+  const [newSource, setNewSource] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState(null);
+  // This page has no Save button: every edit below writes straight to storage and
+  // the card subtitle promises "changes save to browser". When the write is
+  // refused there is otherwise nothing at all on screen to contradict that, and
+  // commissionFor() keeps reading the OLD rate out of storage while the input
+  // shows the new one. Holds which surface failed ("" | "rates" | "ccFee") so the
+  // message appears on the control the operator just used, and only once — two
+  // mounted role="alert" nodes with the same text announce twice.
+  const [saveError, setSaveError] = useState("");
+  const contentRef = useRef(null);
+
+  const handleRefresh = async () => { await Promise.all([refetch(), refPay()]); };
+  usePullToRefresh(handleRefresh);
+
+  const srcRows = useMemo(() => sources.filter((r) => inRange(r.date, dateRange.from, dateRange.to)), [sources, dateRange]);
+
+  // Delegate to the cent-exact channel engine (integer cents via toCents/multiply)
+  // rather than re-summing net_revenue and applying commission in float — the two
+  // must reconcile with Money Kept to the cent. `rates` stays in the deps so an
+  // inline rate edit (which writes storage before setRates) re-runs the memo, and
+  // commissionFor inside the engine reads that same live storage.
+  const channels = useMemo(
+    () => CalculationService.calculateChannelMetrics(srcRows, property || "*"),
+    [srcRows, rates, property, settingsVersion]
+  );
+
+  const totalGross = fromCents(sumCents(channels.map((c) => c.gross)));
+  const totalCommission = fromCents(sumCents(channels.map((c) => c.commission)));
+  const totalPaymentFee = fromCents(sumCents(channels.map((c) => c.paymentFee || 0)));
+  const totalNet = fromCents(sumCents(channels.map((c) => c.net)));
+  const totalNetContribution = fromCents(sumCents(channels.map((c) => c.netContribution ?? c.net)));
+
+  const otaGross = fromCents(sumCents(channels.filter((c) => c.isOta).map((c) => c.gross)));
+  const otaDependence = useMemo(
+    () => calculateOtaDependence(otaGross, totalGross),
+    [otaGross, totalGross]
+  );
+  const shiftOpportunity = useMemo(
+    () => calculateDirectShiftOpportunity(channels, 0.10),
+    [channels]
+  );
+
+  const updateRate = (source, field, value) => {
+    const updated = { ...rates };
+    if (!updated[source]) updated[source] = { type: "percentage", rate: 0, taxExempt: false };
+    let next = value;
+    if (field === "rate") {
+      // Enter plain percentages for percentage types (e.g. 15 → 15%, not 0.15).
+      const n = Number(value);
+      const numVal = Number.isFinite(n) ? Math.max(0, n) : 0;
+      next = updated[source].type === "percentage" ? Math.min(0.9999, numVal / 100) : numVal;
+    }
+    updated[source] = { ...updated[source], [field]: next };
+    // Switching type reinterprets the stored number: a fixed $15 fee read as a
+    // percentage fraction becomes 1500% (commission = gross × 15). The two scales
+    // are incompatible, so reset the rate on a type change and let the operator
+    // re-enter it in the new unit.
+    if (field === "type") updated[source].rate = 0;
+    setRates(updated);
+    setSaveError(setCommissionRates(updated, property || "*") ? "" : "rates");
+  };
+
+  const addSource = () => {
+    if (!newSource.trim()) return;
+    const key = newSource.trim().toUpperCase();
+    const updated = { ...rates, [key]: { type: "percentage", rate: 0, taxExempt: false } };
+    setRates(updated);
+    setSaveError(setCommissionRates(updated, property || "*") ? "" : "rates");
+    setNewSource("");
+  };
+
+  const removeSource = (source) => {
+    const updated = { ...rates };
+    delete updated[source];
+    setRates(updated);
+    setSaveError(setCommissionRates(updated, property || "*") ? "" : "rates");
+  };
+
+  // Memoised: this used to be an inline `.filter(...)` in the JSX, which handed
+  // PaymentMethodChart a brand-new array identity on every render and defeated
+  // its useMemo, so the whole payment-method rollup recomputed on every
+  // keystroke in the fee box.
+  const payRowsInRange = useMemo(
+    () => payRows.filter((r) => inRange(r.date, dateRange.from, dateRange.to)),
+    [payRows, dateRange.from, dateRange.to]
+  );
+
+  const updateCcFee = (v) => {
+    const val = parseFloat(v) || 0;
+    const frac = Math.min(0.9999, Math.max(0, val / 100));
+    setCcFee(frac);
+    setSaveError(setCcFeeRate(frac, property || "*") ? "" : "ccFee");
+  };
+
+  const writeRefusedBanner = (
+    <p
+      role="alert"
+      className="mb-3 rounded-lg border border-[#FF6B6B]/30 bg-[#FF6B6B]/10 px-3 py-2 text-xs text-[#FFB4B4]"
+    >
+      {WRITE_REFUSED}
+    </p>
+  );
+
+  const handleExport = async () => {
+    if (exporting || !contentRef.current) return;
+    setExporting(true);
+    setExportError(null);
+    // `catch (e) {}` was here: a failed render or a blocked download reset the
+    // button to "Export PDF" with no message, which is indistinguishable from a
+    // PDF that saved silently to the downloads folder.
+    try {
+      await exportToPdf(contentRef.current, `RRI_OTA_Channels_${dateRange.from}_${dateRange.to}.pdf`);
+    } catch (e) {
+      setExportError(e?.message || String(e));
+    }
+    setExporting(false);
+  };
+
+  if (sourcesQ.isError || payQ.isError) return <ErrorState title="Could not load channel revenue" description="Channel profitability is unavailable until revenue and payment data load." error={sourcesQ.error || payQ.error} onRetry={handleRefresh} />;
+  if (sourcesQ.isLoading || payQ.isLoading) return <LoadingState title="Loading channel revenue and payments..." />;
+
+  return (
+    <div className="space-y-6">
+      <header className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="text-[11px] uppercase tracking-[0.3em] text-[#00D4FF]">Channel Profitability</p>
+          <h1 className="mt-2 font-heading text-3xl font-semibold text-white">OTA Channels Net Profitability</h1>
+          <p className="mt-1 text-sm text-slate-400">{dateRange.from || "—"} → {dateRange.to || "—"} · {channels.length} channels</p>
+        </div>
+        <button onClick={handleExport} disabled={exporting} className="flex h-11 items-center gap-2 rounded-lg bg-[#6C63FF] px-4 text-sm font-medium text-white transition-colors hover:bg-[#5b52e8] disabled:opacity-50">
+          <FileDown className="h-4 w-4" /><span className="hidden sm:inline">{exporting ? "Generating…" : "Export PDF"}</span>
+        </button>
+      </header>
+
+      {exportError && (
+        <div className="flex items-center gap-2 rounded-lg border border-[#FF6B6B]/30 bg-[#FF6B6B]/10 px-3 py-2 text-xs text-[#FF6B6B]">
+          <TrendingDown className="h-4 w-4 shrink-0" /> The PDF was not created: {exportError}. Nothing was saved to your downloads.
+        </div>
+      )}
+
+      {/* A failed read used to leave this page reading like a month with no
+          bookings: "0 channels" in the header, $0 gross / $0 commission / $0 net
+          in the three KPI cards, and an empty performance matrix. */}
+      {(sourcesQ.isError || payQ.isError) && (
+        <ErrorState
+          title="Could not load channel revenue"
+          description="The channel and payment reads failed, so the zeros below are this page's own placeholder, not what your OTAs sent. Do not renegotiate a commission, drop a channel, or sign off a payout from these numbers."
+          error={sourcesQ.error || payQ.error}
+          onRetry={() => { sourcesQ.refetch(); payQ.refetch(); }}
+        />
+      )}
+
+      <div ref={contentRef} className="space-y-6">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <KpiCard label="Total Gross Revenue" value={money(totalGross)} sub={`${channels.length} active channels`} accent={C.purple} icon={DollarSign} />
+          <KpiCard label="Total Commission Paid" value={money(totalCommission)} sub={`${pct(totalGross ? totalCommission / totalGross : 0, 1)} of gross`} accent={C.coral} icon={TrendingDown} />
+          <KpiCard label="Owner Net Kept" value={money(totalNetContribution)} sub={`${pct(totalGross ? totalNetContribution / totalGross : 0)} net margin`} accent={C.green} icon={Percent} />
+          <div className="rounded-2xl border border-white/5 bg-[#0D1B2E] p-5 shadow-sm">
+            <div className="flex items-center justify-between">
+              <span className="text-xs uppercase tracking-wider text-slate-400">OTA Dependence</span>
+              <span
+                className="h-2.5 w-2.5 rounded-full"
+                style={{ backgroundColor: otaDependence.color }}
+              />
+            </div>
+            <p className="mt-2 font-heading text-2xl font-semibold text-white">
+              {otaDependence.percentage}%
+            </p>
+            <p className="mt-1 text-xs font-medium" style={{ color: otaDependence.color }}>
+              {otaDependence.level} Dependence · {otaDependence.description}
+            </p>
+          </div>
+        </div>
+
+        {shiftOpportunity.potentialSavings > 0 && (
+          <div className="flex flex-col gap-2 rounded-xl border border-[#00E096]/20 bg-[#00E096]/[0.05] p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-3">
+              <div className="rounded-lg bg-[#00E096]/15 p-2 text-[#00E096]">
+                <TrendingUp className="h-4 w-4" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-white">Direct Shift Opportunity</p>
+                <p className="text-xs text-slate-300">
+                  Moving 10% of high-commission OTA bookings ({shiftOpportunity.roomsShifted} rooms) to Direct Website or Walk-in saves{' '}
+                  <span className="font-semibold text-[#00E096]">+{money(shiftOpportunity.potentialSavings)}</span> in commission directly to profit.
+                </p>
+              </div>
+            </div>
+            <div className="text-right">
+              <span className="text-[10px] uppercase tracking-wider text-slate-400">Potential Profit Gain</span>
+              <p className="text-base font-bold text-[#00E096]">+{money(shiftOpportunity.potentialSavings)}</p>
+            </div>
+          </div>
+        )}
+
+        <Card title="Channel Performance Matrix" subtitle="Edit commission rates inline — changes save to browser and reflect instantly">
+          {saveError === "rates" ? writeRefusedBanner : null}
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-[11px] uppercase tracking-widest text-slate-500">
+                  <th className="pb-3 pr-3">Channel</th>
+                  <th className="pb-3 pr-3 text-right">Gross</th>
+                  <th className="pb-3 pr-3">Comm. Type</th>
+                  <th className="pb-3 pr-3 text-right">Rate/Amount</th>
+                  <th className="pb-3 pr-3 text-right">Commission $</th>
+                  <th className="pb-3 pr-3 text-right">Net</th>
+                  <th className="pb-3 pr-3 text-right">Margin</th>
+                  <th className="pb-3 pr-3 text-right">Rooms</th>
+                  <th className="pb-3 pr-3 text-right">ADR</th>
+                  <th className="pb-3">Tax</th>
+                  <th className="pb-3"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {channels.map((c) => {
+                  const rateInfo = rates[c.source] || { type: "none", rate: 0, taxExempt: false };
+                  return (
+                    <tr key={`${c.property_id}:${c.source}`} className="border-t border-white/5 transition-colors hover:bg-white/[0.03]">
+                      <td className="py-2.5 pr-3 font-medium text-slate-200">{c.source}</td>
+                      <td className="py-2.5 pr-3 text-right tabular-nums">{money(c.gross)}</td>
+                      <td className="py-2.5 pr-3">
+                        <select
+                          value={rateInfo.type}
+                          onChange={(e) => updateRate(c.source, "type", e.target.value)}
+                          className="h-8 rounded-lg border border-white/10 bg-[#0A1628] px-2 text-xs text-slate-200"
+                        >
+                          {COMMISSION_TYPES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                        </select>
+                      </td>
+                      <td className="py-2.5 pr-3 text-right">
+                        <input
+                          type="number"
+                          step={rateInfo.type === "percentage" ? "0.01" : "0.5"}
+                          value={rateInfo.type === "percentage" ? Math.round((rateInfo.rate || 0) * 10000) / 100 : rateInfo.rate}
+                          disabled={rateInfo.type === "none"}
+                          onChange={(e) => updateRate(c.source, "rate", parseFloat(e.target.value) || 0)}
+                          className="h-8 w-20 rounded-lg border border-white/10 bg-[#0A1628] px-2 text-right text-xs tabular-nums text-slate-200 disabled:opacity-30"
+                        />
+                      </td>
+                      <td className="py-2.5 pr-3 text-right tabular-nums" style={{ color: c.commission > 0 ? C.coral : "#64748b" }}>
+                        {c.commission > 0 ? `-${money(c.commission)}` : "—"}
+                      </td>
+                      <td className="py-2.5 pr-3 text-right font-medium tabular-nums text-white">{money(c.net)}</td>
+                      <td className="py-2.5 pr-3 text-right tabular-nums" style={{ color: c.margin >= 0.9 ? C.green : C.amber }}>{pct(c.margin)}</td>
+                      <td className="py-2.5 pr-3 text-right tabular-nums text-slate-400">{num(c.stays)}</td>
+                      <td className="py-2.5 pr-3 text-right tabular-nums text-slate-400">{c.stays ? money2(c.gross / c.stays) : "—"}</td>
+                      <td className="py-2.5 pr-3">
+                        <button
+                          onClick={() => updateRate(c.source, "taxExempt", !rateInfo.taxExempt)}
+                          className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${rateInfo.taxExempt ? "bg-[#00D4FF]/15 text-[#00D4FF]" : "bg-white/5 text-slate-500"}`}
+                        >
+                          {rateInfo.taxExempt ? "Exempt" : "Taxable"}
+                        </button>
+                      </td>
+                      <td className="py-2.5 pr-3">
+                        <button onClick={() => removeSource(c.source)} className="text-slate-600 hover:text-[#FF6B6B]">
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-white/5 pt-4">
+            <input
+              type="text"
+              value={newSource}
+              onChange={(e) => setNewSource(e.target.value)}
+              placeholder="Add new source name…"
+              className="h-9 flex-1 min-w-[200px] rounded-lg border border-white/10 bg-[#0A1628] px-3 text-sm text-slate-200 placeholder-slate-600"
+              onKeyDown={(e) => e.key === "Enter" && addSource()}
+            />
+            <button onClick={addSource} className="flex h-9 items-center gap-1.5 rounded-lg bg-[#6C63FF] px-3 text-sm text-white">
+              <Plus className="h-4 w-4" /> Add Source
+            </button>
+          </div>
+        </Card>
+
+        <Card title="Credit/Debit Card Processing Fee" subtitle="Applied to all card charges and refunds">
+          {saveError === "ccFee" ? writeRefusedBanner : null}
+          <div className="flex items-center gap-4">
+            <input
+              type="number"
+              step="0.01"
+              value={Math.round((ccFee || 0) * 10000) / 100}
+              onChange={(e) => updateCcFee(e.target.value)}
+              className="h-10 w-28 rounded-lg border border-white/10 bg-[#0A1628] px-3 text-right text-sm tabular-nums text-slate-200"
+            />
+            <span className="text-sm text-slate-400">% fee on Visa, Mastercard, Amex, Discover transactions</span>
+          </div>
+        </Card>
+
+        <PaymentMethodChart payRows={payRowsInRange} />
+
+        {channels.length > 0 && (
+          <Card title="Channel Optimization Insights">
+            <div className="space-y-3">
+              {channels
+                .filter((c) => c.gross > 1000)
+                .slice(0, 5)
+                .map((c) => {
+                  const isHighMargin = c.margin >= 0.9;
+                  const msg = isHighMargin
+                    ? c.source === "WALK-IN"
+                      ? "100% Margin! Invest in local marketing and walk-in promotions."
+                      : "Highly profitable channel. Focus on growing this segment."
+                    : "High volume channel. Consider negotiating lower commission or pushing direct bookings.";
+                  return (
+                    <div key={`${c.property_id}:${c.source}`} className="flex items-start gap-3 rounded-lg bg-white/[0.03] p-3">
+                      <Lightbulb className="mt-0.5 h-4 w-4 shrink-0 text-[#FFB547]" />
+                      <div className="flex-1">
+                        <p className="text-sm text-white">{c.source}</p>
+                        <p className="text-xs text-slate-400">{msg}</p>
+                      </div>
+                      <span className="text-right text-xs tabular-nums text-slate-500">
+                        {money(c.gross)} · {pct(c.margin)}
+                      </span>
+                    </div>
+                  );
+                })}
+            </div>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}

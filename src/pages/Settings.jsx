@@ -1,0 +1,1961 @@
+import EnterpriseSettings from '@/components/settings/EnterpriseSettings';
+import SettingsConflictNotice from '@/components/settings/SettingsConflictNotice';
+import { db } from '@/api/base44Client';
+
+import React, { useState, useEffect, useRef } from "react";
+import { Link } from "react-router-dom";
+import { Save, Plus, CheckCircle2, RotateCcw, Trash2, Hotel, Edit2, RefreshCw, UserCog, LogOut, Shield, ShieldOff, Key, Smartphone, Download, Upload, Database } from "lucide-react";
+import Card from "@/components/ui-exec/Card";
+import { ErrorState } from "@/components/ui/status";
+import { getCommissionRates, setCommissionRates, getCcFeeRate, setCcFeeRate, getCcFeeOnRefunds, setCcFeeOnRefunds, COMMISSION_TYPES } from "@/lib/commissionRates";
+import { getAlertThresholds, saveAlertThresholds } from "@/lib/alertThresholds";
+import { getRevenueThresholds, saveRevenueThresholds } from "@/lib/revenueThresholds";
+import * as DialogPrimitive from "@radix-ui/react-dialog";
+import { getTaxSettings, saveTaxSettings } from "@/lib/taxSettings";
+import { flushCloudSettingSync, setEditingSettingsLock, isEditingSettingsLocked } from "@/lib/settingsStore";
+import { subscribeSettingsChange, subscribeSettingsConflict } from "@/lib/settingsBus";
+import { rebuildDailyAggregates } from "@/lib/dailyAggregates";
+import { toast } from "@/components/ui/use-toast";
+
+import localDb from '@/api/localDb';
+import { useAuth } from "@/lib/AuthContext";
+import { useProperties } from "@/lib/useHotelData";
+import { queryClientInstance } from "@/lib/query-client";
+import {
+  AlertDialog, AlertDialogTrigger, AlertDialogContent, AlertDialogHeader,
+  AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogAction, AlertDialogCancel,
+} from "@/components/ui/alert-dialog";
+import {
+  Dialog, DialogContent, DialogHeader,
+  DialogTitle, DialogDescription, DialogFooter,
+} from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Loader2 } from "lucide-react";
+import { getCsrfToken, validateCsrfToken, rotateCsrfToken, sanitizeText, sanitizeAlphanumeric, sanitizeCsvCell } from "@/lib/securityUtils";
+import { operationalActionRateLimiter, destructiveActionRateLimiter, securityActionRateLimiter } from "@/lib/rateLimiters";
+import { ARCHIVE_FILE_EXT, downloadArchive, inspectArchiveFile, parseArchive, restoreArchive } from "@/lib/dbArchive";
+import { isBusinessDate as isEntryDate } from "@/lib/businessDate";
+import { hasAllPropertyAccess } from "@/lib/launchPolicy";
+import PasswordConfirmDialog from "@/components/PasswordConfirmDialog";
+
+function localEntryDate() {
+  const date = new Date();
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+export default function Settings() {
+  const { user: me, logout } = useAuth();
+  const [rates, setRates] = useState(() => getCommissionRates());
+  const [ccFee, setCcFee] = useState(() => getCcFeeRate());
+  const [ccRefunds, setCcRefunds] = useState(() => getCcFeeOnRefunds());
+  const [taxRows, setTaxRows] = useState(() => getTaxSettings());
+  const [taxSaved, setTaxSaved] = useState(false);
+  const [newSource, setNewSource] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [deletePhrase, setDeletePhrase] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+  const [thresholds, setThresholds] = useState(() => getAlertThresholds());
+  const [thresholdSaved, setThresholdSaved] = useState(false);
+  const [revThresholds, setRevThresholds] = useState(() => getRevenueThresholds());
+  const [revSaved, setRevSaved] = useState(false);
+  const dirtySections = useRef({ rates: false, tax: false });
+  const [ratesSaving, setRatesSaving] = useState(false);
+  const [taxSaving, setTaxSaving] = useState(false);
+  const isInitialMount = useRef(true);
+  const isRemoteUpdate = useRef(false);
+  const [remoteSyncEpoch, setRemoteSyncEpoch] = useState(0);
+
+  useEffect(() => {
+    return () => {
+      setEditingSettingsLock(false);
+    };
+  }, []);
+
+  // Listen to remote changes or cross-tab settings updates
+  useEffect(() => {
+    const unsubChange = subscribeSettingsChange(() => {
+      if (!isEditingSettingsLocked()) {
+        isRemoteUpdate.current = true;
+        if (!dirtySections.current.rates) {
+          setRates(getCommissionRates());
+          setCcFee(getCcFeeRate());
+          setCcRefunds(getCcFeeOnRefunds());
+        }
+        if (!dirtySections.current.tax) setTaxRows(getTaxSettings());
+        setThresholds(getAlertThresholds());
+        setRevThresholds(getRevenueThresholds());
+        // Force one render even when the pulled values compare equal. The final
+        // guard effect below clears suppression only AFTER every auto-save effect
+        // has observed this remote render, so remote state cannot echo back to D1.
+        setRemoteSyncEpoch((epoch) => epoch + 1);
+      }
+    });
+
+    const unsubConflict = subscribeSettingsConflict((conflict) => {
+      toast({
+        title: "Settings Conflict",
+        description: `Settings were modified on another workstation (rev ${conflict?.serverRevision || ""}). Please review before saving.`,
+        variant: "destructive",
+      });
+    });
+
+    return () => {
+      unsubChange();
+      unsubConflict();
+    };
+  }, []);
+  // Query OBJECT kept alongside the data: propertiesQ.isError drives the banner
+  // above. `?? []` instead of `= []` so a failure is never laundered into an
+  // ordinary empty list.
+  const propertiesQ = useProperties();
+  const properties = propertiesQ.data ?? [];
+  const refetchProps = propertiesQ.refetch;
+  useEffect(() => {
+    if (isInitialMount.current || !propertiesQ.data || isEditingSettingsLocked()) return;
+    // The owner default resolves by property code only after the roster arrives.
+    // Refresh its displayed periods without echoing a read back to cloud storage.
+    isRemoteUpdate.current = true;
+    setTaxRows(getTaxSettings());
+    setRemoteSyncEpoch(epoch => epoch + 1);
+  }, [propertiesQ.data]);
+  const [newPropCode, setNewPropCode] = useState("");
+  const [newPropName, setNewPropName] = useState("");
+  const [newPropRooms, setNewPropRooms] = useState("");
+  const [propMsg, setPropMsg] = useState("");
+  const [propMsgType, setPropMsgType] = useState("info");
+  const [isAddingProp, setIsAddingProp] = useState(false);
+  const [propDeleteTarget, setPropDeleteTarget] = useState(null);
+  const [propEditTarget, setPropEditTarget] = useState(null);
+  const [editPropName, setEditPropName] = useState("");
+  const [editPropRooms, setEditPropRooms] = useState("");
+  const [editPropCity, setEditPropCity] = useState("");
+  const [editPropState, setEditPropState] = useState("");
+  const [isSavingEditProp, setIsSavingEditProp] = useState(false);
+  const [isTogglingActive, setIsTogglingActive] = useState(null);
+  const [isDeletingProp, setIsDeletingProp] = useState(false);
+  const [deleteConfirmCode, setDeleteConfirmCode] = useState("");
+  
+  // MFA self-service state
+  const [mfaSetupOpen, setMfaSetupOpen] = useState(false);
+  const [mfaSecret, setMfaSecret] = useState(null);
+  const [mfaUri, setMfaUri] = useState(null);
+  const [, setMfaBackupCodes] = useState([]);
+  const [mfaVerifying, setMfaVerifying] = useState(false);
+  const [mfaAction, setMfaAction] = useState(null); // 'enable' | 'disable'
+  // Step-up prompt for MFA changes: { kind: 'enable' | 'disable', busy, error }.
+  // The typed password lives inside PasswordConfirmDialog and is handed to the
+  // run* function directly — it is never lifted into this page's state.
+  const [pwPrompt, setPwPrompt] = useState(null);
+
+  // Backup & restore. `restorePlan` holds the PARSED archive rather than the raw
+  // file, so the summary the operator confirms against is the file's verified
+  // contents — row counts, export date, checksum — and not just its name.
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [restorePlan, setRestorePlan] = useState(null);
+  const [restoreError, setRestoreError] = useState("");
+  const [restorePhrase, setRestorePhrase] = useState("");
+  const restoreInputRef = useRef(null);
+
+  // Auto-save commission rates & CC fee to localStorage on change (skip on mount or remote sync)
+  useEffect(() => {
+    if (isInitialMount.current || isRemoteUpdate.current) return;
+    setCommissionRates(rates);
+    setCcFeeRate(ccFee);
+    setCcFeeOnRefunds(ccRefunds);
+  }, [rates, ccFee, ccRefunds]);
+
+  // Auto-save alert thresholds (skip on mount or remote sync)
+  useEffect(() => {
+    if (isInitialMount.current || isRemoteUpdate.current) return;
+    saveAlertThresholds(thresholds);
+  }, [thresholds]);
+
+  // Auto-save revenue thresholds (skip on mount or remote sync)
+  useEffect(() => {
+    if (isInitialMount.current || isRemoteUpdate.current) return;
+    saveRevenueThresholds(revThresholds);
+  }, [revThresholds]);
+
+  // Auto-save tax settings (skip on mount or remote sync)
+  useEffect(() => {
+    if (isInitialMount.current || isRemoteUpdate.current) return;
+    const clean = taxRows.map(({ _key, ...rest }) => rest);
+    saveTaxSettings(clean);
+  }, [taxRows]);
+
+  // Effects run in declaration order. This must stay after every auto-save
+  // effect: on the first mount they all see isInitialMount=true; after a remote
+  // pull they all see isRemoteUpdate=true. Only then is saving re-enabled.
+  useEffect(() => {
+    isInitialMount.current = false;
+    isRemoteUpdate.current = false;
+  }, [remoteSyncEpoch]);
+
+  const handleChange = (key, field, val) => {
+    dirtySections.current.rates = true;
+    setEditingSettingsLock(true);
+    setEditingSettingsLock(true);
+    const cur = rates[key] || { type: "percentage", rate: 0, taxExempt: false };
+    if (field === "rate") {
+      // Enter plain percentages for percentage types (e.g. 15 → 15%, not 0.15).
+      // Fixed $ / actual values are stored as-is.
+      const n = Number(val);
+      const numVal = Number.isFinite(n) ? Math.max(0, n) : 0;
+      const stored = cur.type === "percentage" ? Math.min(0.9999, numVal / 100) : numVal;
+      setRates({ ...rates, [key]: { ...cur, rate: stored } });
+    } else {
+      setRates({ ...rates, [key]: { ...cur, [field]: val } });
+    }
+  };
+
+  const handleCcFeeChange = (val) => {
+    dirtySections.current.rates = true;
+    setEditingSettingsLock(true);
+    setEditingSettingsLock(true);
+    const v = Number(val);
+    setCcFee(v);
+  };
+
+  const handleAdd = () => {
+    dirtySections.current.rates = true;
+    setEditingSettingsLock(true);
+    const name = newSource.trim().toUpperCase();
+    if (name && !rates[name]) {
+      setRates({ ...rates, [name]: { type: "percentage", rate: 0, taxExempt: false } });
+      setNewSource("");
+    }
+  };
+
+  const handleRemove = (key) => {
+    dirtySections.current.rates = true;
+    setEditingSettingsLock(true);
+    const next = { ...rates };
+    delete next[key];
+    setRates(next);
+  };
+
+  const handleSave = async () => {
+    if (ratesSaving) return;
+    const rateLimit = operationalActionRateLimiter.check();
+    if (!rateLimit.allowed) {
+      toast({ variant: "destructive", title: "Rate Limited", description: `Too many requests. Try again in ${Math.ceil(rateLimit.retryAfter / 60)} minutes.` });
+      return;
+    }
+    const csrfToken = getCsrfToken();
+    if (!validateCsrfToken(csrfToken)) {
+      toast({ variant: "destructive", title: "Security Error", description: "Invalid security token. Please refresh the page and try again." });
+      rotateCsrfToken();
+      return;
+    }
+    const stored = [
+      setCommissionRates(rates),
+      setCcFeeRate(ccFee),
+      setCcFeeOnRefunds(ccRefunds),
+    ].every(Boolean);
+    if (!stored) {
+      // The write was refused by the browser, so the PREVIOUS rates are still
+      // what every net-revenue figure in the app is computed from. Showing the
+      // "Saved" tick here is how an owner ends up billing commission at a rate
+      // they replaced weeks ago. Nothing to audit-log either: nothing changed.
+      toast({
+        variant: "destructive",
+        title: "Not saved",
+        description: "The browser refused to store these rates, so the previous commission and card-fee rates are still in effect and will come back when you reload. Storage may be full, or this window may be in private browsing. See the browser console for the exact key.",
+      });
+      rotateCsrfToken();
+      return;
+    }
+    dirtySections.current.rates = false;
+    setEditingSettingsLock(dirtySections.current.tax);
+    setRatesSaving(true);
+    try {
+      await db.audit.log({
+        username: me?.username || "settings",
+        action: "Commission rates updated",
+        detail: `${Object.keys(rates).length} source rate(s) · CC fee ${(ccFee * 100).toFixed(2)}% · fee on refunds ${ccRefunds ? "on" : "off"}`,
+      });
+    } catch (e) {
+      // The rates are already applied at this point, so this is not a failed
+      // save — it is an unlogged one. Commission and CC-fee rates change every
+      // net-revenue figure in the app, so an operator has to know the change
+      // exists but has no audit trail behind it.
+      toast({
+        variant: "destructive",
+        title: "Saved, but not logged",
+        description: `The new commission rates are in effect, but the audit log entry could not be written (${e?.message || e}). Note the change manually — Audit Log will not show it.`,
+      });
+    }
+    flushCloudSettingSync().catch(() => {});
+    queryClientInstance.invalidateQueries({ queryKey: ["sources"] });
+    queryClientInstance.invalidateQueries({ queryKey: ["payments"] });
+    queryClientInstance.invalidateQueries({ queryKey: ["daily-aggregates"] });
+    rebuildDailyAggregates({ propertyId: "all" }).catch(() => {});
+    setRatesSaving(false);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+    rotateCsrfToken();
+  };
+
+  const handleReset = () => {
+    dirtySections.current.rates = false;
+    setEditingSettingsLock(dirtySections.current.tax);
+    const fresh = getCommissionRates();
+    setRates(fresh);
+    setCcFee(getCcFeeRate());
+    setCcRefunds(getCcFeeOnRefunds());
+  };
+
+  const updateTaxRow = (i, patch) => {
+    dirtySections.current.tax = true;
+    setEditingSettingsLock(true);
+    setTaxRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+  };
+
+  const addTaxRow = () => {
+    dirtySections.current.tax = true;
+    setEditingSettingsLock(true);
+    setTaxRows((prev) => [
+      ...prev,
+      {
+        _key: `${Date.now()}_${prev.length}`,
+        property_id: "*",
+        state_rate: 0,
+        city_rate: 0,
+        other_rate: 0,
+        effective_start: localEntryDate(),
+        effective_end: "",
+      },
+    ]);
+  };
+
+  const removeTaxRow = (i) => {
+    dirtySections.current.tax = true;
+    setEditingSettingsLock(true);
+    setTaxRows((prev) => prev.filter((_, idx) => idx !== i));
+  };
+
+  const handleSaveTax = async () => {
+    if (taxSaving) return;
+    const rateLimit = operationalActionRateLimiter.check();
+    if (!rateLimit.allowed) {
+      toast({ variant: "destructive", title: "Rate Limited", description: `Too many requests. Try again in ${Math.ceil(rateLimit.retryAfter / 60)} minutes.` });
+      return;
+    }
+    const csrfToken = getCsrfToken();
+    if (!validateCsrfToken(csrfToken)) {
+      toast({ variant: "destructive", title: "Security Error", description: "Invalid security token. Please refresh the page and try again." });
+      rotateCsrfToken();
+      return;
+    }
+    const invalidTax = taxRows.find((row) =>
+      [row.state_rate, row.city_rate, row.other_rate].some((rate) => !Number.isFinite(Number(rate)) || Number(rate) < 0 || Number(rate) > 1) ||
+      (row.effective_start && !isEntryDate(row.effective_start)) ||
+      (row.effective_end && !isEntryDate(row.effective_end)) ||
+      (row.effective_start && row.effective_end && row.effective_end < row.effective_start));
+    if (invalidTax) {
+      toast({ variant: "destructive", title: "Check tax settings", description: "Use rates from 0% to 100%, valid dates, and an end date on or after the start date." });
+      return;
+    }
+    const clean = taxRows.map(({ _key, ...rest }) => rest);
+    if (!saveTaxSettings(clean)) {
+      toast({
+        variant: "destructive",
+        title: "Not saved",
+        description: "The browser refused to store these tax periods, so the previous rates are still what every tax figure is computed from and will come back when you reload. Storage may be full, or this window may be in private browsing. See the browser console for the exact key.",
+      });
+      rotateCsrfToken();
+      return;
+    }
+    dirtySections.current.tax = false;
+    setEditingSettingsLock(dirtySections.current.rates);
+    setTaxSaving(true);
+    try {
+      await db.audit.log({
+        username: me?.username || "settings",
+        action: "Tax settings updated",
+        detail: `${clean.length} tax period(s): ${clean
+          .map((r) => `${r.property_id || "*"} S${((r.state_rate || 0) * 100).toFixed(2)}% C${((r.city_rate || 0) * 100).toFixed(2)}% O${((r.other_rate || 0) * 100).toFixed(2)}% (${r.effective_start || "open"}${r.effective_end ? ` → ${r.effective_end}` : ""})`)
+          .join("; ")}`,
+      });
+    } catch (e) {
+      // Same shape as the commission-rate save above: the tax periods are
+      // already persisted, so the defect is the missing audit row. Tax rates
+      // change every tax figure the property reports, so an unlogged change here
+      // is the one an accountant would most want to trace.
+      toast({
+        variant: "destructive",
+        title: "Saved, but not logged",
+        description: `The new tax settings are in effect, but the audit log entry could not be written (${e?.message || e}). Note the change manually — Audit Log will not show it.`,
+      });
+    }
+    flushCloudSettingSync().catch(() => {});
+    queryClientInstance.invalidateQueries({ queryKey: ["payments"] });
+    queryClientInstance.invalidateQueries({ queryKey: ["sources"] });
+    queryClientInstance.invalidateQueries({ queryKey: ["occupancy"] });
+    queryClientInstance.invalidateQueries({ queryKey: ["gross"] });
+    queryClientInstance.invalidateQueries({ queryKey: ["expenses"] });
+    queryClientInstance.invalidateQueries({ queryKey: ["payroll"] });
+    queryClientInstance.invalidateQueries({ queryKey: ["daily-aggregates"] });
+    rebuildDailyAggregates({ propertyId: "all" }).catch(() => {});
+    setTaxSaving(false);
+    setTaxSaved(true);
+    setTimeout(() => setTaxSaved(false), 2000);
+    rotateCsrfToken();
+  };
+
+  const handleBackupDownload = async () => {
+    const rateLimit = operationalActionRateLimiter.check();
+    if (!rateLimit.allowed) {
+      toast({ variant: "destructive", title: "Rate Limited", description: `Too many requests. Try again in ${Math.ceil(rateLimit.retryAfter / 60)} minutes.` });
+      return;
+    }
+    const csrfToken = getCsrfToken();
+    if (!validateCsrfToken(csrfToken)) {
+      toast({ variant: "destructive", title: "Security Error", description: "Invalid security token. Please refresh the page and try again." });
+      rotateCsrfToken();
+      return;
+    }
+    setBackupBusy(true);
+    try {
+      const res = await downloadArchive();
+      toast({
+        title: "Backup downloaded",
+        description: `${res.total_rows.toLocaleString()} record(s) from ${res.stores} table(s), plus ${res.local_slots} setting(s), saved as ${res.filename}. Keep a copy somewhere other than this computer.`,
+      });
+      try {
+        await db.audit.log({
+          username: me?.username || "settings",
+          action: "Database backup exported",
+          detail: `${res.filename} · ${res.total_rows} row(s) · ${res.stores} table(s) · ${res.local_slots} setting(s) · ${Math.round(res.bytes / 1024)} KB`,
+        });
+      } catch (e) {
+        // The file is already on disk, so this is not a failed export — it is an
+        // unlogged one. A copy of the entire database leaving the machine is
+        // exactly the event an audit trail exists to record, so say so plainly.
+        toast({
+          variant: "destructive",
+          title: "Downloaded, but not logged",
+          description: `The backup file was created, but the audit log entry could not be written (${e?.message || e}). A full copy of the database left this browser with no record of it.`,
+        });
+      }
+    } catch (e) {
+      toast({
+        variant: "destructive",
+        title: "Backup failed",
+        description: `${e?.message || e} No file was written — do not treat this as a backup.`,
+      });
+    } finally {
+      setBackupBusy(false);
+      rotateCsrfToken();
+    }
+  };
+
+  const handleRestoreFile = async (event) => {
+    const file = event.target?.files?.[0];
+    // Cleared immediately so picking the SAME file again still fires `change`.
+    // Without this, correcting a mistake by re-choosing the same file does
+    // nothing and looks like the button is broken.
+    if (event.target) event.target.value = "";
+    setRestorePlan(null);
+    setRestorePhrase("");
+    setRestoreError("");
+    if (!file) return;
+    const gate = inspectArchiveFile(file);
+    if (!gate.ok) {
+      setRestoreError(gate.reason);
+      return;
+    }
+    setRestoreBusy(true);
+    try {
+      // parseArchive validates the whole file — format, version, checksum, per
+      // table row counts — and touches nothing. Everything below this point is
+      // shown to the operator BEFORE any data is replaced.
+      const parsed = await parseArchive(await file.text());
+      setRestorePlan({ filename: file.name, parsed });
+    } catch (e) {
+      setRestoreError(e?.message || String(e));
+    } finally {
+      setRestoreBusy(false);
+    }
+  };
+
+  const handleRestoreConfirm = async () => {
+    if (!restorePlan) return;
+    const rateLimit = destructiveActionRateLimiter.check();
+    if (!rateLimit.allowed) {
+      toast({ variant: "destructive", title: "Rate Limited", description: `Too many requests. Try again in ${Math.ceil(rateLimit.retryAfter / 60)} minutes.` });
+      return;
+    }
+    const csrfToken = getCsrfToken();
+    if (!validateCsrfToken(csrfToken)) {
+      toast({ variant: "destructive", title: "Security Error", description: "Invalid security token. Please refresh the page and try again." });
+      rotateCsrfToken();
+      return;
+    }
+    setRestoreBusy(true);
+    setRestoreError("");
+    try {
+      const res = await restoreArchive(restorePlan.parsed, { confirm: "REPLACE" });
+      try {
+        // Logged AFTER the restore, deliberately. The AuditLog table was just
+        // replaced by the backup's rows, so an entry written beforehand would
+        // have been erased by the very action it records. Written afterwards it
+        // appends to the restored hash chain and survives.
+        await db.audit.log({
+          username: me?.username || "settings",
+          action: "Database restored from backup",
+          detail: `${restorePlan.filename} · exported ${res.exported_at || "unknown"} · ${res.total_rows} row(s) into ${res.stores} table(s) · ${res.local_slots} setting(s) · checksum ${String(res.checksum || "").slice(0, 12)}`,
+        });
+      } catch {
+        // The restore itself succeeded and the operator is about to be signed
+        // out; a missing log line must not read as a failed restore.
+      }
+      queryClientInstance.clear();
+      toast({
+        title: "Database restored",
+        description: `${res.total_rows.toLocaleString()} record(s) restored.${res.warnings.length ? ` ${res.warnings.join(" ")}` : ""} Signing you out so the app reloads against the restored data.`,
+      });
+      setRestorePlan(null);
+      setRestorePhrase("");
+      // The signed-in account came out of the database that was just replaced —
+      // its row may not exist any more, or may have a different password. A hard
+      // navigation is the only way to be certain nothing in memory still refers
+      // to rows that are gone.
+      await logout(false);
+      window.location.replace("/login");
+    } catch (e) {
+      setRestoreError(`${e?.message || e} Your existing data was left unchanged.`);
+      setRestoreBusy(false);
+    }
+  };
+
+  const handleSaveThresholds = () => {
+    const rateLimit = operationalActionRateLimiter.check();
+    if (!rateLimit.allowed) {
+      toast({ variant: "destructive", title: "Rate Limited", description: `Too many requests. Try again in ${Math.ceil(rateLimit.retryAfter / 60)} minutes.` });
+      return;
+    }
+    const csrfToken = getCsrfToken();
+    if (!validateCsrfToken(csrfToken)) {
+      toast({ variant: "destructive", title: "Security Error", description: "Invalid security token. Please refresh the page and try again." });
+      rotateCsrfToken();
+      return;
+    }
+    if (!saveAlertThresholds(thresholds)) {
+      toast({
+        variant: "destructive",
+        title: "Not saved",
+        description: "The browser refused to store these alert thresholds, so the previous ones are still in effect. Storage may be full, or this window may be in private browsing.",
+      });
+      rotateCsrfToken();
+      return;
+    }
+    flushCloudSettingSync().catch(() => {});
+    setThresholdSaved(true);
+    setTimeout(() => setThresholdSaved(false), 2000);
+    rotateCsrfToken();
+  };
+
+  const handleSaveRevThresholds = () => {
+    const rateLimit = operationalActionRateLimiter.check();
+    if (!rateLimit.allowed) {
+      toast({ variant: "destructive", title: "Rate Limited", description: `Too many requests. Try again in ${Math.ceil(rateLimit.retryAfter / 60)} minutes.` });
+      return;
+    }
+    const csrfToken = getCsrfToken();
+    if (!validateCsrfToken(csrfToken)) {
+      toast({ variant: "destructive", title: "Security Error", description: "Invalid security token. Please refresh the page and try again." });
+      rotateCsrfToken();
+      return;
+    }
+    if (!saveRevenueThresholds(revThresholds)) {
+      toast({
+        variant: "destructive",
+        title: "Not saved",
+        description: "The browser refused to store these revenue bands, so the previous ones are still in effect. Storage may be full, or this window may be in private browsing.",
+      });
+      rotateCsrfToken();
+      return;
+    }
+    flushCloudSettingSync().catch(() => {});
+    setRevSaved(true);
+    setTimeout(() => setRevSaved(false), 2000);
+    rotateCsrfToken();
+  };
+
+  const withActionTimeout = (promise, ms = 8000, message = "Operation timed out. Please check your connection and try again.") =>
+    Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+    ]);
+
+  const handleAddProperty = async () => {
+    if (!newPropCode.trim() || !newPropName.trim()) return;
+    const rateLimit = operationalActionRateLimiter.check();
+    if (!rateLimit.allowed) {
+      toast({ variant: "destructive", title: "Rate Limited", description: `Too many requests. Try again in ${Math.ceil(rateLimit.retryAfter / 60)} minutes.` });
+      return;
+    }
+    const csrfToken = getCsrfToken();
+    if (!validateCsrfToken(csrfToken)) {
+      toast({ variant: "destructive", title: "Security Error", description: "Invalid security token. Please refresh the page and try again." });
+      rotateCsrfToken();
+      return;
+    }
+    const sanitizedCode = sanitizeAlphanumeric(newPropCode.trim()).toUpperCase();
+    if (!sanitizedCode) {
+      setPropMsg("Invalid property code.");
+      setPropMsgType("error");
+      return;
+    }
+    setPropMsg("");
+    setPropMsgType("info");
+    setIsAddingProp(true);
+    try {
+      const existing = await withActionTimeout(
+        db.entities.Property.filter({ code: sanitizedCode }),
+        8000,
+        "Timed out checking existing property."
+      );
+      if (existing.length > 0) {
+        setPropMsg(`Property with code "${sanitizedCode}" already exists (${existing[0].name || "Active"}).`);
+        setPropMsgType("error");
+        refetchProps();
+        queryClientInstance.invalidateQueries({ queryKey: ["properties"] });
+        return;
+      }
+      const sanitizedName = sanitizeCsvCell(sanitizeText(newPropName.trim()));
+      const sanitizedRooms = Number(newPropRooms);
+      if (!Number.isInteger(sanitizedRooms) || sanitizedRooms < 1 || sanitizedRooms > 10000) {
+        setPropMsg("Enter a whole room count from 1 to 10,000."); setPropMsgType("error"); return;
+      }
+      await withActionTimeout(
+        db.entities.Property.create({
+          code: sanitizedCode,
+          name: sanitizedName,
+          rooms: sanitizedRooms,
+          active: true,
+        }),
+        8000,
+        "Timed out adding property."
+      );
+      setPropMsg(`Property "${sanitizedName}" added.`);
+      setPropMsgType("success");
+      setNewPropCode("");
+      setNewPropName("");
+      setNewPropRooms("");
+      refetchProps();
+      queryClientInstance.invalidateQueries({ queryKey: ["properties"] });
+      rotateCsrfToken();
+    } catch (e) {
+      const errMsg = e?.message || "Could not add property.";
+      if (/already mapped|belongs to another property/i.test(String(errMsg))) {
+        setPropMsg(`Property code "${sanitizedCode}" is already mapped on the server.`);
+      } else {
+        setPropMsg(errMsg);
+      }
+      setPropMsgType("error");
+      refetchProps();
+      queryClientInstance.invalidateQueries({ queryKey: ["properties"] });
+    } finally {
+      setIsAddingProp(false);
+    }
+  };
+
+  const handleToggleActive = async (property) => {
+    if (!property?.id || isTogglingActive) return;
+    setIsTogglingActive(property.id);
+    try {
+      const nextActive = property.active === false ? true : false;
+      await withActionTimeout(
+        db.entities.Property.update(property.id, { active: nextActive }),
+        8000,
+        "Timed out updating property status."
+      );
+      toast({
+        title: nextActive ? "Property Activated" : "Property Deactivated",
+        description: `${property.name} (${property.code}) is now ${nextActive ? "Active" : "Inactive"}.`,
+      });
+      refetchProps();
+      queryClientInstance.invalidateQueries({ queryKey: ["properties"] });
+    } catch (e) {
+      toast({
+        variant: "destructive",
+        title: "Could not update property status",
+        description: e?.message || "Failed to update property.",
+      });
+    } finally {
+      setIsTogglingActive(null);
+    }
+  };
+
+  const handleOpenEditModal = (property) => {
+    setPropEditTarget(property);
+    setEditPropName(property.name || "");
+    setEditPropRooms(String(property.rooms || 100));
+    setEditPropCity(property.city || "");
+    setEditPropState(property.state || "");
+  };
+
+  const handleSaveEditProperty = async () => {
+    if (isSavingEditProp || !propEditTarget?.id) return;
+    const sanitizedName = sanitizeCsvCell(sanitizeText(editPropName.trim()));
+    if (!sanitizedName) {
+      toast({ variant: "destructive", title: "Validation Error", description: "Property name is required." });
+      return;
+    }
+    const sanitizedRooms = Number(editPropRooms);
+    if (!Number.isInteger(sanitizedRooms) || sanitizedRooms < 1 || sanitizedRooms > 10000) {
+      toast({ variant: "destructive", title: "Check room count", description: "Enter a whole room count from 1 to 10,000." }); return;
+    }
+    const sanitizedCity = sanitizeCsvCell(sanitizeText(editPropCity.trim()));
+    const sanitizedState = sanitizeAlphanumeric(editPropState.trim()).toUpperCase().slice(0, 10);
+    setIsSavingEditProp(true);
+    try {
+      await withActionTimeout(
+        db.entities.Property.update(propEditTarget.id, {
+          name: sanitizedName,
+          rooms: sanitizedRooms,
+          city: sanitizedCity || null,
+          state: sanitizedState || null,
+        }),
+        8000,
+        "Timed out saving property changes."
+      );
+      toast({
+        title: "Property Updated",
+        description: `Changes to "${sanitizedName}" saved successfully.`,
+      });
+      setPropEditTarget(null);
+      refetchProps();
+      queryClientInstance.invalidateQueries({ queryKey: ["properties"] });
+    } catch (e) {
+      toast({
+        variant: "destructive",
+        title: "Could not update property",
+        description: e?.message || "Failed to save property changes.",
+      });
+    } finally {
+      setIsSavingEditProp(false);
+    }
+  };
+
+  const handleDeleteProperty = async (id) => {
+    const rateLimit = destructiveActionRateLimiter.check();
+    if (!rateLimit.allowed) {
+      toast({ variant: "destructive", title: "Rate Limited", description: `Too many requests. Try again in ${Math.ceil(rateLimit.retryAfter / 60)} minutes.` });
+      return;
+    }
+    const csrfToken = getCsrfToken();
+    if (!validateCsrfToken(csrfToken)) {
+      toast({ variant: "destructive", title: "Security Error", description: "Invalid security token. Please refresh the page and try again." });
+      rotateCsrfToken();
+      return;
+    }
+    setIsDeletingProp(true);
+    try {
+      // 1. Authoritative delete: server D1 cascade deletes all business_record rows
+      // referencing this property and the property row atomically in <500ms.
+      await withActionTimeout(
+        db.entities.Property.delete(id),
+        8000,
+        "Timed out deleting property."
+      );
+
+      // 2. Direct client-side cleanup of local IndexedDB tables in milliseconds
+      // without making 38,000+ individual HTTP network requests.
+      const propertyTables = [
+        "OccupancyDay", "SourceDay", "GrossRevenueDay", "PaymentDay",
+        "ClerkShiftRecord", "UploadedReport", "Expense", "PayrollRun", "Staff",
+        "Room", "RoomStay", "HousekeepingTask", "WeatherSnapshot", "Review",
+        "DailyFinancialAggregate", "ScanResult", "TimecardPunch", "Reservation"
+      ];
+      for (const tableName of propertyTables) {
+        if (localDb[tableName]?.where) {
+          try {
+            await localDb[tableName].where("property_id").equals(id).delete();
+          } catch {
+            // Some tables may not have property_id index
+          }
+        }
+      }
+
+      setPropDeleteTarget(null);
+      setDeleteConfirmCode("");
+      setPropMsg("Property removed successfully.");
+      setPropMsgType("success");
+      refetchProps();
+      queryClientInstance.invalidateQueries({ queryKey: ["properties"] });
+      queryClientInstance.invalidateQueries({ queryKey: ["occupancy"] });
+      queryClientInstance.invalidateQueries({ queryKey: ["sources"] });
+      queryClientInstance.invalidateQueries({ queryKey: ["gross"] });
+      queryClientInstance.invalidateQueries({ queryKey: ["payments"] });
+      queryClientInstance.invalidateQueries({ queryKey: ["expenses"] });
+      queryClientInstance.invalidateQueries({ queryKey: ["payroll"] });
+      rotateCsrfToken();
+    } catch (e) {
+      setPropMsg(e.message || "Could not delete property.");
+      setPropMsgType("error");
+    } finally {
+      setIsDeletingProp(false);
+    }
+  };
+
+  const handleDeleteAccount = async () => {
+    setDeleting(true);
+    setDeleteError("");
+    try {
+      // Destructive action: pass the server-mandated confirmation token
+      // ("DELETE:<userId>") so a stray/replayed call can never trigger the wipe.
+      // Only an active Owner/Admin is permitted (enforced in functions.invoke).
+      const confirmToken = `DELETE:${me?.id ?? ""}`;
+      await db.functions.invoke("deleteAccount", { confirm: confirmToken });
+      // No local cleanup here on purpose: invokeBackend() in base44Client.js
+      // (PROTECTED) already clears every Dexie table AND localStorage on a
+      // successful deleteAccount, on both dispatch routes. Two removeItem calls
+      // used to sit here; they could not help, they named 2 of the 3 keys that
+      // one settings module owns, and being unguarded they could throw into the
+      // catch below and report a FAILED deletion after the account was gone.
+      //
+      // logout() is the AuthContext one (destructured at the top of this
+      // component), whose parameter is a boolean `shouldRedirect` — the same
+      // call the three other logout sites in this file make. db.auth.logout()
+      // takes a redirect URL instead, so the previous `db.auth.logout(true)`
+      // assigned `window.location.href = true` and sent a just-deleted account
+      // to <origin>/true. See BRAIN_TROUBLESHOOTING section 36.
+      await logout(true);
+    } catch (e) {
+      setDeleteError(e?.message || "Your account could not be deleted. You are still signed in, and no logout was performed.");
+      setDeleting(false);
+    }
+  };
+
+  // MFA self-service handlers
+  //
+  // Both actions are step-up operations on the server (custom_user_admin
+  // enable_mfa/disable_mfa call assertActorPassword), so the flow is: local
+  // rate-limit + CSRF pre-checks -> collect the actor's own password -> invoke.
+  // The pre-checks run BEFORE the prompt so a rate-limited operator is told so
+  // instead of typing a password that was never going to be sent.
+  const mfaPreflight = () => {
+    const rateLimit = securityActionRateLimiter.check();
+    if (!rateLimit.allowed) {
+      toast({ variant: "destructive", title: "Rate Limited", description: `Too many requests. Try again in ${Math.ceil(rateLimit.retryAfter / 60)} minutes.` });
+      return false;
+    }
+    const csrfToken = getCsrfToken();
+    if (!validateCsrfToken(csrfToken)) {
+      toast({ variant: "destructive", title: "Security Error", description: "Invalid security token. Please refresh the page and try again." });
+      rotateCsrfToken();
+      return false;
+    }
+    return true;
+  };
+
+  const runMfaEnable = async (currentPassword) => {
+    setPwPrompt((p) => (p ? { ...p, busy: true, error: null } : p));
+    try {
+      const result = await db.users.enableMfa(me, me.id, currentPassword);
+      setPwPrompt(null);
+      setMfaSecret(result.secret);
+      setMfaUri(result.uri);
+      setMfaBackupCodes([]);
+      setMfaAction('enable');
+      setMfaSetupOpen(true);
+    } catch (e) {
+      // A refused password has to stay in the dialog so it can be retyped; any
+      // other failure is not something the dialog can help with, so it closes
+      // and reports through the normal toast channel.
+      const message = e?.message || "Two-factor authentication could not be enabled.";
+      if (currentPassword !== undefined && /password/i.test(message)) {
+        setPwPrompt((p) => (p ? { ...p, busy: false, error: message } : p));
+        return;
+      }
+      setPwPrompt(null);
+      toast({ variant: "destructive", title: "Error", description: message });
+    }
+  };
+
+  const handleMfaEnable = () => {
+    if (!mfaPreflight()) return;
+    // Enrolling for the first time needs no password; ROTATING a live factor
+    // does, because that action replaces a secret the account is currently
+    // protected by. The server decides either way — this only avoids asking for
+    // a password that would be ignored.
+    if (me.mfa_enabled) {
+      setPwPrompt({ kind: 'enable', busy: false, error: null });
+      return;
+    }
+    runMfaEnable(undefined);
+  };
+
+  const runMfaDisable = async (currentPassword) => {
+    setPwPrompt((p) => (p ? { ...p, busy: true, error: null } : p));
+    try {
+      await db.users.disableMfa(me, me.id, currentPassword);
+      setPwPrompt(null);
+      // The server revokes EVERY session for the account here, this tab's
+      // included. Staying on the page would leave a signed-in-looking UI whose
+      // next request 401s, so end the session locally too and say why.
+      toast({ title: "MFA Disabled", description: "Two-factor authentication is off and every session was signed out. Please log in again." });
+      await logout(true);
+    } catch (e) {
+      const message = e?.message || "Two-factor authentication could not be disabled.";
+      if (/password/i.test(message)) {
+        setPwPrompt((p) => (p ? { ...p, busy: false, error: message } : p));
+        return;
+      }
+      setPwPrompt(null);
+      toast({ variant: "destructive", title: "Error", description: message });
+    }
+  };
+
+  const handleMfaDisable = () => {
+    if (!mfaPreflight()) return;
+    setPwPrompt({ kind: 'disable', busy: false, error: null });
+  };
+
+  const handleMfaSetupComplete = async (token, done) => {
+    if (done) {
+      setMfaSetupOpen(false);
+      setMfaSecret(null);
+      setMfaUri(null);
+      setMfaBackupCodes([]);
+      setMfaAction(null);
+      return;
+    }
+    if (!token) return;
+    setMfaVerifying(true);
+    try {
+      await db.users.verifyMfa(me, me.id, token);
+      toast({ title: "MFA Enabled Successfully!", description: "Your account is now protected with two-factor authentication." });
+      setMfaSetupOpen(false);
+      setMfaSecret(null);
+      setMfaUri(null);
+      setMfaBackupCodes([]);
+      setMfaAction(null);
+    } catch (e) {
+      toast({ variant: "destructive", title: "Invalid Code", description: e.message || "The code is incorrect or has expired." });
+    } finally {
+      setMfaVerifying(false);
+    }
+  };
+
+  const handleMfaSetupCancel = () => {
+    setMfaSetupOpen(false);
+    setMfaSecret(null);
+    setMfaUri(null);
+    setMfaBackupCodes([]);
+    setMfaAction(null);
+  };
+
+  // Render QR code when MFA dialog opens
+  const qrCanvasRef = useRef(/** @type {HTMLCanvasElement | null} */ (null));
+  const [qrError, setQrError] = useState(null);
+  useEffect(() => {
+    if (mfaSetupOpen && mfaUri && qrCanvasRef.current) {
+      setQrError(null);
+      // Both failure paths used to end in console.error or nothing at all: the
+      // dialog kept saying "Scan the QR code" over a blank canvas, and the
+      // operator had no way to know the code was never drawn. The manual secret
+      // below still works, so say to use it.
+      import("qrcode").then(QRCode => {
+        QRCode.default.toCanvas(qrCanvasRef.current, mfaUri, {
+          width: 200,
+          margin: 2,
+          color: { dark: '#000000', light: '#ffffff' }
+        }).catch((e) => setQrError(e?.message || String(e)));
+      }).catch((e) => setQrError(e?.message || String(e)));
+    }
+  }, [mfaSetupOpen, mfaUri]);
+
+  const entries = Object.entries(rates).sort((a, b) => a[0].localeCompare(b[0]));
+
+  return (
+    <div
+      className="space-y-6"
+      onFocusCapture={() => setEditingSettingsLock(true)}
+      onBlurCapture={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget)) {
+          setEditingSettingsLock(dirtySections.current.rates || dirtySections.current.tax);
+        }
+      }}
+    >
+      <header>
+        <p className="text-[11px] uppercase tracking-[0.3em] text-[#00D4FF]">Configuration</p>
+        <h1 className="mt-2 font-heading text-3xl font-semibold text-white">Settings</h1>
+        <p className="mt-1 text-sm text-slate-400">
+          Commission rates, alert thresholds, user access, and account management.
+        </p>
+      </header>
+
+      <SettingsConflictNotice />
+      <EnterpriseSettings />
+
+      {/* A failed property read is surfaced, not swallowed. The dropdown below
+          would otherwise show only "All properties (default)" and read as a
+          single-property install — and a new property added from this page while
+          the list is broken would appear to vanish the moment it saved. */}
+      {propertiesQ.isError && (
+        <ErrorState
+          title="Properties could not be loaded"
+          description="Property-scoped settings and the property management list below may be incomplete until this loads."
+          error={propertiesQ.error}
+          onRetry={refetchProps}
+        />
+      )}
+
+      <Card title="Source commission rates" subtitle="Editable per-source — supports %, fixed $, actual, or none. Tax-exempt = OTA pre-deducts commission.">
+        <div className="space-y-2">
+          {entries.map(([key, info]) => {
+            const r = info || { type: "none", rate: 0, taxExempt: false };
+            return (
+              <div key={key} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/5 bg-[#0A1628]/60 px-4 py-3">
+                <span className="text-sm font-medium text-slate-200">{key}</span>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={r.type}
+                    onChange={(e) => handleChange(key, "type", e.target.value)}
+                    className="h-8 rounded-lg border border-white/10 bg-[#040D1A] px-2 text-xs text-slate-200 outline-none focus:border-[#00D4FF]"
+                  >
+                    {COMMISSION_TYPES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                  </select>
+                  <input
+                    type="number"
+                    min="0"
+                    step={r.type === "percentage" ? "0.01" : "0.5"}
+                    value={r.type === "percentage" ? Math.round((r.rate || 0) * 10000) / 100 : r.rate}
+                    disabled={r.type === "none"}
+                    onChange={(e) => handleChange(key, "rate", e.target.value)}
+                    className="w-20 rounded-lg border border-white/10 bg-[#040D1A] px-3 py-1.5 text-right text-sm text-slate-200 outline-none focus:border-[#00D4FF] disabled:opacity-30"
+                  />
+                  <span className="w-6 text-xs text-slate-500">{r.type === "fixed" ? "$/rm" : r.type === "percentage" ? "%" : ""}</span>
+                  <button
+                    onClick={() => handleChange(key, "taxExempt", !r.taxExempt)}
+                    className={`rounded-full px-2.5 py-1 text-[10px] font-medium transition-colors ${r.taxExempt ? "bg-[#00D4FF]/15 text-[#00D4FF]" : "bg-white/5 text-slate-500"}`}
+                  >
+                    {r.taxExempt ? "Exempt" : "Taxable"}
+                  </button>
+                  <button onClick={() => handleRemove(key)} className="text-slate-600 transition-colors hover:text-[#FF6B6B]">
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="mt-4 rounded-xl border border-white/5 bg-[#0A1628]/60 p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-slate-200">CC/Debit Card Processing Fee</p>
+              <p className="text-xs text-slate-500">Applied to Visa, Mastercard, Amex, Discover charges and refunds</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min="0"
+                max="10"
+                step="0.1"
+                value={(ccFee * 100).toFixed(2)}
+                onChange={(e) => handleCcFeeChange(Number(e.target.value) / 100)}
+                className="w-24 rounded-lg border border-white/10 bg-[#040D1A] px-3 py-1.5 text-right text-sm text-slate-200 outline-none focus:border-[#00D4FF]"
+              />
+              <span className="text-sm text-slate-400">%</span>
+            </div>
+          </div>
+          <label className="mt-3 flex items-center gap-2 text-sm text-slate-300">
+            <input
+              type="checkbox"
+              checked={ccRefunds}
+              onChange={(e) => { dirtySections.current.rates = true; setEditingSettingsLock(true); setCcRefunds(e.target.checked); }}
+              className="h-4 w-4 rounded border-white/20"
+            />
+            Apply the processing fee to refunds too (refunds also incur the card fee)
+          </label>
+        </div>
+
+        <div className="mt-4 flex gap-2">
+          <input
+            type="text"
+            value={newSource}
+            onChange={(e) => setNewSource(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleAdd()}
+            placeholder="Add new source name…"
+            className="flex-1 rounded-lg border border-white/10 bg-[#0A1628] px-3 py-2 text-sm text-slate-200 outline-none focus:border-[#00D4FF]"
+          />
+          <button
+            onClick={handleAdd}
+            className="flex items-center gap-2 rounded-lg border border-white/10 px-4 py-2 text-sm text-slate-300 transition-colors hover:border-[#6C63FF]/60 hover:text-white"
+          >
+            <Plus className="h-4 w-4" /> Add
+          </button>
+        </div>
+
+        <div className="mt-4 flex gap-3">
+          <button
+            onClick={handleSave}
+            disabled={ratesSaving}
+            className="flex items-center gap-2 rounded-lg bg-[#6C63FF] px-6 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#5b52e8]"
+          >
+            {saved ? <CheckCircle2 className="h-4 w-4 text-[#00E096]" /> : <Save className="h-4 w-4" />}
+            {saved ? "Saved!" : "Save Rates"}
+          </button>
+          <button
+            onClick={handleReset}
+            className="flex items-center gap-2 rounded-lg border border-white/10 px-4 py-2.5 text-sm text-slate-400 transition-colors hover:border-[#FF6B6B]/60 hover:text-[#FF6B6B]"
+          >
+            <RotateCcw className="h-4 w-4" /> Reset to defaults
+          </button>
+        </div>
+      </Card>
+
+      <Card title="Tax settings (per property)" subtitle="State, city/local, and other tax rates with effective dates. Imported PMS tax lines remain authoritative. Estimates use the period covering each business date; a blank start applies to all dates.">
+        <div className="space-y-2">
+          {taxRows.map((row, i) => (
+            <div
+              key={row._key || i}
+              className="grid gap-2 rounded-xl border border-white/5 bg-[#0A1628]/60 px-4 py-3 sm:grid-cols-2 lg:grid-cols-7"
+            >
+              <div className="lg:col-span-2">
+                <label className="mb-1 block text-[10px] uppercase tracking-widest text-slate-500">Property</label>
+                <select
+                  value={row.property_id || "*"}
+                  onChange={(e) => updateTaxRow(i, { property_id: e.target.value })}
+                  className="w-full rounded-lg border border-white/10 bg-[#040D1A] px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-[#00D4FF]"
+                >
+                  <option value="*">All properties (default)</option>
+                  {properties.map((p) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              </div>
+              {[
+                ["state_rate", "State Tax %"],
+                ["city_rate", "City/Local Tax %"],
+                ["other_rate", "Other Tax % (opt.)"],
+              ].map(([key, label]) => (
+                <div key={key}>
+                  <label className="mb-1 block text-[10px] uppercase tracking-widest text-slate-500">{label}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    max="50"
+                    step="0.01"
+                    value={((row[key] || 0) * 100).toFixed(2)}
+                    onChange={(e) => updateTaxRow(i, { [key]: Number(e.target.value) / 100 })}
+                    className="w-full rounded-lg border border-white/10 bg-[#040D1A] px-2 py-1.5 text-right text-xs text-slate-200 outline-none focus:border-[#00D4FF]"
+                  />
+                </div>
+              ))}
+              <div className="flex items-end">
+                <div className="w-full rounded-lg border border-[#00D4FF]/30 bg-[#00D4FF]/10 px-3 py-2 text-center text-sm font-medium text-[#00D4FF]">
+                  Combined: {(((row.state_rate || 0) + (row.city_rate || 0) + (row.other_rate || 0)) * 100).toFixed(2)}%
+                </div>
+              </div>
+              <div>
+                <label className="mb-1 block text-[10px] uppercase tracking-widest text-slate-500">Effective Start</label>
+                <input
+                  type="date"
+                  value={row.effective_start || ""}
+                  onChange={(e) => updateTaxRow(i, { effective_start: e.target.value })}
+                  className="w-full rounded-lg border border-white/10 bg-[#040D1A] px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-[#00D4FF]"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-[10px] uppercase tracking-widest text-slate-500">Effective End (opt.)</label>
+                <input
+                  type="date"
+                  value={row.effective_end || ""}
+                  onChange={(e) => updateTaxRow(i, { effective_end: e.target.value })}
+                  className="w-full rounded-lg border border-white/10 bg-[#040D1A] px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-[#00D4FF]"
+                />
+              </div>
+              <div className="flex items-end">
+                <button
+                  onClick={() => removeTaxRow(i)}
+                  className="rounded-lg border border-white/10 p-2 text-slate-500 transition-colors hover:border-[#FF6B6B]/60 hover:text-[#FF6B6B]"
+                  title="Remove this tax period"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          ))}
+          {!taxRows.length && (
+            <p className="text-sm text-slate-500">
+              No tax rates configured — taxes are estimated from the combined default rate until you add property-specific settings.
+            </p>
+          )}
+        </div>
+
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <button
+            onClick={addTaxRow}
+            className="flex items-center gap-2 rounded-lg border border-white/10 px-4 py-2.5 text-sm text-slate-300 transition-colors hover:border-[#6C63FF]/60 hover:text-white"
+          >
+            <Plus className="h-4 w-4" /> Add tax period
+          </button>
+          <button
+            onClick={handleSaveTax}
+            disabled={taxSaving}
+            className="flex items-center gap-2 rounded-lg bg-[#6C63FF] px-6 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#5b52e8]"
+          >
+            {taxSaved ? <CheckCircle2 className="h-4 w-4 text-[#00E096]" /> : <Save className="h-4 w-4" />}
+            {taxSaved ? "Saved!" : "Save Tax Settings"}
+          </button>
+          <span className="text-xs text-slate-500">Changes are recorded in the audit log and update the Executive Hub instantly.</span>
+        </div>
+      </Card>
+
+      <Card title="Alert thresholds" subtitle="Configure when revenue and occupancy drop alerts appear on the dashboard">
+        <div className="space-y-3">
+          <div className="flex items-center justify-between rounded-xl border border-white/5 bg-[#0A1628]/60 px-4 py-3">
+            <span className="text-sm text-slate-200">Revenue decrease alert</span>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min="0"
+                max="100"
+                step="1"
+                value={(thresholds.revenueDecreasePct * 100).toFixed(0)}
+                onChange={(e) => setThresholds({ ...thresholds, revenueDecreasePct: Number(e.target.value) / 100 })}
+                className="w-20 rounded-lg border border-white/10 bg-[#040D1A] px-3 py-1.5 text-right text-sm text-slate-200 outline-none focus:border-[#00D4FF]"
+              />
+              <span className="text-sm text-slate-400">% min drop</span>
+            </div>
+          </div>
+          <div className="flex items-center justify-between rounded-xl border border-white/5 bg-[#0A1628]/60 px-4 py-3">
+            <span className="text-sm text-slate-200">Occupancy decrease alert</span>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min="0"
+                max="100"
+                step="1"
+                value={(thresholds.occupancyDecreasePoints * 100).toFixed(0)}
+                onChange={(e) => setThresholds({ ...thresholds, occupancyDecreasePoints: Number(e.target.value) / 100 })}
+                className="w-20 rounded-lg border border-white/10 bg-[#040D1A] px-3 py-1.5 text-right text-sm text-slate-200 outline-none focus:border-[#00D4FF]"
+              />
+              <span className="text-sm text-slate-400">pp min drop</span>
+            </div>
+          </div>
+          <div className="flex items-center justify-between rounded-xl border border-[#FF6B6B]/15 bg-[#FF6B6B]/[0.04] px-4 py-3">
+            <span className="text-sm text-slate-200">Low occupancy threshold</span>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min="0"
+                max="100"
+                step="1"
+                value={((thresholds.occupancyThreshold ?? 0.60) * 100).toFixed(0)}
+                onChange={(e) => setThresholds({ ...thresholds, occupancyThreshold: Number(e.target.value) / 100 })}
+                className="w-20 rounded-lg border border-white/10 bg-[#040D1A] px-3 py-1.5 text-right text-sm text-slate-200 outline-none focus:border-[#00D4FF]"
+              />
+              <span className="text-sm text-slate-400">% trigger</span>
+            </div>
+          </div>
+          <button
+            onClick={handleSaveThresholds}
+            className="flex items-center gap-2 rounded-lg bg-[#6C63FF] px-6 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#5b52e8]"
+          >
+            {thresholdSaved ? <CheckCircle2 className="h-4 w-4 text-[#00E096]" /> : <Save className="h-4 w-4" />}
+            {thresholdSaved ? "Saved!" : "Save Thresholds"}
+          </button>
+        </div>
+      </Card>
+
+      <Card title="Revenue color thresholds" subtitle="Used by Monthly Calendar and daily detail panel for revenue-based coloring">
+        <div className="space-y-3">
+          <div className="flex items-center justify-between rounded-xl border border-[#4ade80]/15 bg-[#4ade80]/[0.04] px-4 py-3">
+            <span className="text-sm text-slate-200">High revenue threshold (green)</span>
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-slate-400">$</span>
+              <input
+                type="number" min="0" step="100"
+                value={revThresholds.highRevenueThreshold}
+                onChange={(e) => setRevThresholds({ ...revThresholds, highRevenueThreshold: Number(e.target.value) })}
+                className="w-24 rounded-lg border border-white/10 bg-[#040D1A] px-3 py-1.5 text-right text-sm text-slate-200 outline-none focus:border-[#00D4FF]"
+              />
+              <span className="text-sm text-slate-400">+</span>
+            </div>
+          </div>
+          <div className="flex items-center justify-between rounded-xl border border-white/5 bg-[#0A1628]/60 px-4 py-3">
+            <span className="text-sm text-slate-200">Medium revenue threshold (gray)</span>
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-slate-400">$</span>
+              <input
+                type="number" min="0" step="100"
+                value={revThresholds.mediumRevenueThreshold}
+                onChange={(e) => setRevThresholds({ ...revThresholds, mediumRevenueThreshold: Number(e.target.value) })}
+                className="w-24 rounded-lg border border-white/10 bg-[#040D1A] px-3 py-1.5 text-right text-sm text-slate-200 outline-none focus:border-[#00D4FF]"
+              />
+              <span className="text-sm text-slate-400">+</span>
+            </div>
+          </div>
+          <p className="text-xs text-slate-500">
+            Days with revenue ≥ high threshold: <span className="text-[#4ade80]">green</span> ·
+            ≥ medium: <span className="text-slate-400">gray</span> ·
+            below medium: <span className="text-[#ff6b6b]">red</span>
+          </p>
+          <button
+            onClick={handleSaveRevThresholds}
+            className="flex items-center gap-2 rounded-lg bg-[#6C63FF] px-6 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#5b52e8]"
+          >
+            {revSaved ? <CheckCircle2 className="h-4 w-4 text-[#00E096]" /> : <Save className="h-4 w-4" />}
+            {revSaved ? "Saved!" : "Save Revenue Thresholds"}
+          </button>
+        </div>
+      </Card>
+
+      <Card title="Property management" subtitle="Add and manage hotel properties for multi-property reporting">
+        <div className="space-y-2">
+          {properties.map((p) => (
+            <div key={p.id} className="flex items-center justify-between rounded-xl border border-white/5 bg-[#0A1628]/60 px-4 py-3">
+              <div className="flex items-center gap-3">
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[#00D4FF]/20 bg-[#00D4FF]/10 text-[#00D4FF]">
+                  <Hotel className="h-5 w-5" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-medium text-white">{p.name}</p>
+                    <span className="font-mono text-xs text-[#00D4FF]/80 bg-[#00D4FF]/10 px-1.5 py-0.5 rounded border border-[#00D4FF]/20">
+                      {p.code}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-400">
+                    {p.rooms || 100} rooms{p.city ? ` · ${p.city}` : ""}{p.state ? `, ${p.state}` : ""}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleToggleActive(p)}
+                  disabled={isTogglingActive === p.id}
+                  title={p.active !== false ? "Click to deactivate (hide from dashboards)" : "Click to activate property"}
+                  className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-all ${
+                    p.active !== false
+                      ? "border border-[#00E096]/30 bg-[#00E096]/15 text-[#00E096] hover:bg-[#00E096]/25"
+                      : "border border-amber-500/30 bg-amber-500/15 text-amber-400 hover:bg-amber-500/25"
+                  }`}
+                >
+                  {isTogglingActive === p.id ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <span className={`h-1.5 w-1.5 rounded-full ${p.active !== false ? "bg-[#00E096] animate-pulse" : "bg-amber-400"}`} />
+                  )}
+                  {p.active !== false ? "Active" : "Inactive"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleOpenEditModal(p)}
+                  className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-[#0A1628] px-2.5 py-1 text-xs text-slate-300 transition-colors hover:border-[#00D4FF]/40 hover:text-[#00D4FF]"
+                  title="Edit property details"
+                >
+                  <Edit2 className="h-3.5 w-3.5" />
+                  Edit
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeleteConfirmCode("");
+                    setPropDeleteTarget(p);
+                  }}
+                  className="inline-flex items-center gap-1 rounded-lg border border-white/5 bg-transparent px-2.5 py-1 text-xs text-slate-400 transition-colors hover:border-red-500/30 hover:bg-red-500/10 hover:text-red-400"
+                  title="Remove property"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Remove
+                </button>
+              </div>
+            </div>
+          ))}
+          {propertiesQ.isLoading && (
+            <div className="flex items-center gap-2 py-3 text-sm text-slate-400">
+              <Loader2 className="h-4 w-4 animate-spin text-[#00D4FF]" />
+              Loading properties...
+            </div>
+          )}
+          {!propertiesQ.isLoading && !properties.length && (
+            <p className="text-sm text-slate-500">No properties yet. Add your first property below.</p>
+          )}
+        </div>
+
+        <AlertDialog open={!!propDeleteTarget} onOpenChange={(open) => { if (!open && !isDeletingProp) { setPropDeleteTarget(null); setDeleteConfirmCode(""); } }}>
+          <AlertDialogContent className="border-white/10 bg-[#0F1F35]">
+            <AlertDialogHeader>
+              <AlertDialogTitle className="text-white">Remove property “{propDeleteTarget?.name}”?</AlertDialogTitle>
+              <AlertDialogDescription asChild>
+                <div className="space-y-3 text-sm text-slate-400">
+                  <p>
+                    This permanently deletes the property and <span className="text-[#FF6B6B]">all</span> of its associated
+                    report rows (occupancy, revenue, clerk records, expenses, payroll, and uploads). This cannot be undone.
+                  </p>
+                  <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-2.5 text-xs text-amber-300">
+                    💡 <strong>Keep your financial history:</strong> If this property is no longer active and you do not want to add new reports, you can simply mark it as <strong>Inactive</strong> instead of deleting it.
+                  </div>
+                  <div className="pt-2">
+                    <label className="text-xs font-medium text-slate-300">
+                      Type <strong className="text-white">{propDeleteTarget?.code}</strong> to confirm deletion:
+                    </label>
+                    <Input
+                      value={deleteConfirmCode}
+                      onChange={(e) => setDeleteConfirmCode(e.target.value)}
+                      placeholder={`Type ${propDeleteTarget?.code || ""} to confirm`}
+                      disabled={isDeletingProp}
+                      className="mt-1 border-white/10 bg-[#0A1628] text-sm text-white focus:border-red-500"
+                    />
+                  </div>
+                </div>
+              </AlertDialogDescription>
+              {propMsg && propMsgType === "error" && <p className="text-sm text-[#FF6B6B]">{propMsg}</p>}
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel
+                disabled={isDeletingProp}
+                className="border-white/10 bg-[#0A1628] text-slate-300 hover:bg-[#1a2a40] hover:text-white"
+              >
+                Cancel
+              </AlertDialogCancel>
+              <AlertDialogAction
+                disabled={isDeletingProp || (deleteConfirmCode.trim().toUpperCase() !== String(propDeleteTarget?.code || "").trim().toUpperCase())}
+                onClick={(e) => {
+                  e.preventDefault();
+                  if (propDeleteTarget) handleDeleteProperty(propDeleteTarget.id);
+                }}
+                className="bg-[#FF6B6B] text-white hover:bg-[#e55555] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {isDeletingProp ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Deleting...
+                  </>
+                ) : (
+                  "Yes, delete property"
+                )}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        <Dialog open={!!propEditTarget} onOpenChange={(open) => { if (!open && !isSavingEditProp) setPropEditTarget(null); }}>
+          <DialogContent className="border-white/10 bg-[#0F1F35] text-white sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle className="text-lg font-semibold text-white">Edit Property Details</DialogTitle>
+              <DialogDescription className="text-xs text-slate-400">
+                Update property name, room capacity, and location details.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-4 py-2">
+              <div>
+                <label className="text-xs font-medium text-slate-400">Property Code (Immutable)</label>
+                <Input
+                  value={propEditTarget?.code || ""}
+                  disabled
+                  className="mt-1 border-white/10 bg-[#0A1628]/60 text-slate-400 cursor-not-allowed text-sm font-mono"
+                />
+                <p className="mt-1 text-[11px] text-slate-500">Property code links directly to imported data and cannot be renamed.</p>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-slate-300">Property Name *</label>
+                <Input
+                  value={editPropName}
+                  onChange={(e) => setEditPropName(e.target.value)}
+                  placeholder="e.g. Red Roof Middleboro"
+                  disabled={isSavingEditProp}
+                  className="mt-1 border-white/10 bg-[#0A1628] text-white text-sm focus:border-[#00D4FF]"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-slate-300">Total Rooms</label>
+                <Input
+                  type="number"
+                  min="1"
+                  max="10000"
+                  value={editPropRooms}
+                  onChange={(e) => setEditPropRooms(e.target.value)}
+                  disabled={isSavingEditProp}
+                  className="mt-1 border-white/10 bg-[#0A1628] text-white text-sm focus:border-[#00D4FF]"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-medium text-slate-300">City</label>
+                  <Input
+                    value={editPropCity}
+                    onChange={(e) => setEditPropCity(e.target.value)}
+                    placeholder="e.g. Middleborough"
+                    disabled={isSavingEditProp}
+                    className="mt-1 border-white/10 bg-[#0A1628] text-white text-sm focus:border-[#00D4FF]"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-slate-300">State</label>
+                  <Input
+                    value={editPropState}
+                    onChange={(e) => setEditPropState(e.target.value)}
+                    placeholder="e.g. MA"
+                    maxLength={10}
+                    disabled={isSavingEditProp}
+                    className="mt-1 border-white/10 bg-[#0A1628] text-white text-sm focus:border-[#00D4FF]"
+                  />
+                </div>
+              </div>
+            </div>
+            <DialogFooter className="gap-2 sm:gap-0">
+              <Button
+                variant="ghost"
+                disabled={isSavingEditProp}
+                onClick={() => setPropEditTarget(null)}
+                className="border-white/10 bg-[#0A1628] text-slate-300 hover:bg-[#1a2a40] hover:text-white"
+              >
+                Cancel
+              </Button>
+              <Button
+                disabled={isSavingEditProp || !editPropName.trim()}
+                onClick={handleSaveEditProperty}
+                className="bg-[#00D4FF] font-medium text-black hover:bg-[#00b8dc]"
+              >
+                {isSavingEditProp ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Saving...
+                  </>
+                ) : (
+                  "Save Changes"
+                )}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        <div className="mt-4 grid gap-2 sm:grid-cols-4">
+          <input
+            type="text"
+            value={newPropCode}
+            onChange={(e) => setNewPropCode(e.target.value)}
+            placeholder="Code (e.g. RRI1416)"
+            disabled={isAddingProp}
+            className="rounded-lg border border-white/10 bg-[#0A1628] px-3 py-2 text-sm text-slate-200 outline-none focus:border-[#00D4FF] disabled:opacity-50"
+          />
+          <input
+            type="text"
+            value={newPropName}
+            onChange={(e) => setNewPropName(e.target.value)}
+            placeholder="Property name"
+            disabled={isAddingProp}
+            className="sm:col-span-2 rounded-lg border border-white/10 bg-[#0A1628] px-3 py-2 text-sm text-slate-200 outline-none focus:border-[#00D4FF] disabled:opacity-50"
+          />
+          <input
+            type="number"
+            min="1"
+            value={newPropRooms}
+            onChange={(e) => setNewPropRooms(e.target.value)}
+            placeholder="Rooms"
+            disabled={isAddingProp}
+            className="rounded-lg border border-white/10 bg-[#0A1628] px-3 py-2 text-sm text-slate-200 outline-none focus:border-[#00D4FF] disabled:opacity-50"
+          />
+        </div>
+        <div className="mt-3 flex items-center gap-3">
+          <button
+            onClick={handleAddProperty}
+            disabled={isAddingProp || !newPropCode.trim() || !newPropName.trim()}
+            className="flex items-center gap-2 rounded-lg bg-[#6C63FF] px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#5b52e8] disabled:opacity-50"
+          >
+            {isAddingProp ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+            {isAddingProp ? "Adding Property..." : "Add Property"}
+          </button>
+          <button
+            onClick={async () => {
+              try { await db.entities.Property.list(); } catch {}
+              refetchProps();
+              queryClientInstance.invalidateQueries({ queryKey: ["properties"] });
+            }}
+            disabled={propertiesQ.isFetching}
+            className="flex items-center gap-2 rounded-lg border border-white/10 px-4 py-2.5 text-sm text-slate-400 transition-colors hover:border-[#00D4FF]/60 hover:text-white disabled:opacity-50"
+          >
+            <RefreshCw className={`h-4 w-4 ${propertiesQ.isFetching ? "animate-spin text-[#00D4FF]" : ""}`} /> Refresh
+          </button>
+          {propMsg && (
+            <span className={`text-sm ${propMsgType === "error" ? "text-[#FF6B6B]" : "text-[#00E096]"}`}>
+              {propMsg}
+            </span>
+          )}
+        </div>
+      </Card>
+
+      <Card title="User management" subtitle="Create accounts, assign roles, permissions, and property access">
+        <div className="space-y-3">
+          <p className="text-sm text-slate-400">
+            Manage logins, roles, permissions, and property-level access from the User Management page.
+          </p>
+          <Link
+            to="/users"
+            className="inline-flex items-center gap-2 rounded-lg bg-[#6C63FF] px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#5b52e8]"
+          >
+            <UserCog className="h-4 w-4" /> Open User Management
+          </Link>
+        </div>
+      </Card>
+
+      <Card title="My account" subtitle="Your profile, role, session, and security">
+        {me && (
+          <div className="space-y-6">
+            <div className="flex items-center gap-3 rounded-xl border border-white/5 bg-[#0A1628]/60 px-4 py-3">
+              <div className="flex h-11 w-11 items-center justify-center rounded-full bg-[#6C63FF]/30 text-base font-bold text-white">
+                {(me.full_name || me.username || "?").slice(0, 1).toUpperCase()}
+              </div>
+              <div>
+                <p className="text-sm font-medium text-white">{me.full_name || me.username}</p>
+                <p className="text-xs text-slate-400">{me.email}</p>
+                <p className="mt-0.5 text-[10px] uppercase tracking-wide text-[#6C63FF]">
+                  {me.role?.replace("_", " ") || "user"}
+                </p>
+              </div>
+            </div>
+
+            {/* MFA Section */}
+            <div className="rounded-xl border border-white/5 bg-[#0A1628]/60 p-4">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-3">
+                  {me.mfa_enabled ? (
+                    <Shield className="h-5 w-5 text-emerald-400" />
+                  ) : (
+                    <ShieldOff className="h-5 w-5 text-slate-500" />
+                  )}
+                  <div>
+                    <p className="text-sm font-medium text-white">Two-Factor Authentication</p>
+                    <p className="text-xs text-slate-500">
+                      {me.mfa_enabled 
+                        ? "MFA is enabled. You'll need your authenticator app to log in." 
+                        : "Add an extra layer of security to your account."}
+                    </p>
+                  </div>
+                </div>
+                {me.mfa_enabled ? (
+                  <button
+                    onClick={handleMfaDisable}
+                    className="text-sm text-amber-400 hover:text-amber-300 transition-colors"
+                  >
+                    Disable MFA
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleMfaEnable}
+                    className="inline-flex items-center gap-2 rounded-lg bg-emerald-500/10 border border-emerald-500/30 px-3 py-1.5 text-sm font-medium text-emerald-400 transition-colors hover:bg-emerald-500/20"
+                  >
+                    <Shield className="h-3.5 w-3.5" /> Enable MFA
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <PasswordConfirmDialog
+              isOpen={!!pwPrompt}
+              busy={!!pwPrompt?.busy}
+              error={pwPrompt?.error || null}
+              title={pwPrompt?.kind === 'disable' ? 'Disable two-factor authentication' : 'Replace your second factor'}
+              description={
+                pwPrompt?.kind === 'disable'
+                  ? 'Enter your password to turn two-factor authentication off. Every session on this account will be signed out, including this one.'
+                  : 'Enter your password to issue a new authenticator secret. Your existing authenticator entry will stop working and other sessions will be signed out.'
+              }
+              confirmLabel={pwPrompt?.kind === 'disable' ? 'Disable MFA' : 'Replace factor'}
+              onCancel={() => setPwPrompt(null)}
+              onConfirm={(password) => (pwPrompt?.kind === 'disable' ? runMfaDisable(password) : runMfaEnable(password))}
+            />
+
+            <div className="flex flex-wrap gap-2">
+              <Link
+                to="/change-password"
+                className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-4 py-2.5 text-sm text-slate-300 transition-colors hover:border-[#6C63FF]/60 hover:text-white"
+              >
+                <Key className="h-3.5 w-3.5" /> Change Password
+              </Link>
+              <button
+                onClick={() => logout(true)}
+                className="inline-flex items-center gap-2 rounded-lg border border-[#FF6B6B]/30 bg-[#FF6B6B]/10 px-4 py-2.5 text-sm font-medium text-[#FF6B6B] transition-colors hover:bg-[#FF6B6B]/20"
+              >
+                <LogOut className="h-4 w-4" /> Log out
+              </button>
+            </div>
+          </div>
+        )}
+      </Card>
+
+      {hasAllPropertyAccess(me) && (
+        <Card title="Backup & restore" subtitle="Save the whole database to a file, or replace it from one">
+          <div className="space-y-6">
+            <Alert className="border-amber-500/30 bg-amber-500/10">
+              <AlertDescription className="text-sm text-slate-300">
+                Every record in this app — staff, payroll, expenses, imported reports, commission
+                rates and tax periods — is stored in <strong>this browser, on this computer</strong>.
+                There is no copy on a server. Clearing site data, resetting the machine or moving to
+                a different laptop loses all of it. A backup file is the only way to move the data or
+                get it back.
+              </AlertDescription>
+            </Alert>
+
+            <div>
+              <button
+                onClick={handleBackupDownload}
+                disabled={backupBusy}
+                className="flex items-center gap-2 rounded-lg bg-[#6C63FF] px-6 py-2.5 text-sm font-medium text-white transition-colors hover:bg-[#5b52e8] disabled:opacity-60"
+              >
+                {backupBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                {backupBusy ? "Building backup…" : "Download backup"}
+              </button>
+              <p className="mt-2 text-xs text-slate-500">
+                Writes a single <code className="text-slate-400">{ARCHIVE_FILE_EXT}</code> file
+                holding every table and every setting, with a checksum so a damaged file is refused
+                rather than half-restored. Do a fresh one after any large import, and keep it
+                somewhere other than this computer.
+              </p>
+            </div>
+
+            <div className="border-t border-white/10 pt-6">
+              <Label className="text-sm font-medium text-slate-200">Restore from a backup</Label>
+              <p className="mt-1 text-xs text-slate-500">
+                Restoring <strong className="text-slate-400">replaces</strong> everything currently
+                in this browser with the contents of the file. It cannot merge two databases — row
+                ids from two machines would collide and records would end up attached to the wrong
+                property. Download a backup of what is here first if you want to keep it.
+              </p>
+
+              <input
+                ref={restoreInputRef}
+                type="file"
+                accept={ARCHIVE_FILE_EXT}
+                onChange={handleRestoreFile}
+                className="hidden"
+              />
+              <button
+                onClick={() => restoreInputRef.current?.click()}
+                disabled={restoreBusy}
+                className="mt-3 inline-flex items-center gap-2 rounded-lg border border-white/10 px-4 py-2.5 text-sm text-slate-300 transition-colors hover:border-[#6C63FF]/60 hover:text-white disabled:opacity-60"
+              >
+                {restoreBusy && !restorePlan ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
+                {restoreBusy && !restorePlan ? "Checking file…" : "Choose backup file…"}
+              </button>
+
+              {restoreError && (
+                <Alert className="mt-3 border-[#FF6B6B]/30 bg-[#FF6B6B]/10">
+                  <AlertDescription className="whitespace-pre-line text-sm text-[#FF6B6B]">
+                    {restoreError}
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {restorePlan && (
+                <div className="mt-4 rounded-lg border border-[#FF6B6B]/30 bg-[#0A1628] p-4">
+                  <div className="flex items-center gap-2 text-sm font-medium text-white">
+                    <Database className="h-4 w-4 text-[#FF6B6B]" />
+                    {restorePlan.filename}
+                  </div>
+                  <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
+                    <dt className="text-slate-500">Records in the file</dt>
+                    <dd className="text-slate-300">{restorePlan.parsed.totalRows.toLocaleString()}</dd>
+                    <dt className="text-slate-500">Tables</dt>
+                    <dd className="text-slate-300">{restorePlan.parsed.storeNames.length}</dd>
+                    <dt className="text-slate-500">Settings</dt>
+                    <dd className="text-slate-300">{restorePlan.parsed.localSlotKeys.length}</dd>
+                    <dt className="text-slate-500">Exported</dt>
+                    <dd className="text-slate-300">
+                      {restorePlan.parsed.archive.exported_at
+                        ? new Date(restorePlan.parsed.archive.exported_at).toLocaleString()
+                        : "unknown"}
+                    </dd>
+                    <dt className="text-slate-500">Exported by</dt>
+                    <dd className="break-all text-slate-300">{restorePlan.parsed.archive.exported_by || "unknown"}</dd>
+                  </dl>
+
+                  {restorePlan.parsed.missingStores.length > 0 && (
+                    /* Not a refusal: an older backup predates a table this build
+                       added. Named so nobody discovers the empty table later. */
+                    <p className="mt-3 text-xs text-amber-400">
+                      This backup predates {restorePlan.parsed.missingStores.length} table(s) —{" "}
+                      {restorePlan.parsed.missingStores.join(", ")}. They will be left empty after
+                      the restore.
+                    </p>
+                  )}
+
+                  <p className="mt-3 text-xs text-slate-400">
+                    Type <strong className="text-[#FF6B6B]">REPLACE</strong> to confirm that
+                    everything currently in this browser should be discarded.
+                  </p>
+                  <input
+                    type="text"
+                    value={restorePhrase}
+                    onChange={(e) => setRestorePhrase(e.target.value)}
+                    placeholder="Type REPLACE to confirm"
+                    className="mt-2 w-full rounded-lg border border-white/10 bg-[#0F1F35] px-3 py-2 text-sm text-slate-200 outline-none focus:border-[#FF6B6B]"
+                  />
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      onClick={handleRestoreConfirm}
+                      disabled={restorePhrase !== "REPLACE" || restoreBusy}
+                      className="flex items-center gap-2 rounded-lg border border-[#FF6B6B]/30 bg-[#FF6B6B]/10 px-4 py-2.5 text-sm font-medium text-[#FF6B6B] transition-colors hover:bg-[#FF6B6B]/20 disabled:opacity-50"
+                    >
+                      {restoreBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+                      {restoreBusy ? "Restoring…" : "Replace this database"}
+                    </button>
+                    <button
+                      onClick={() => { setRestorePlan(null); setRestorePhrase(""); setRestoreError(""); }}
+                      disabled={restoreBusy}
+                      className="rounded-lg border border-white/10 px-4 py-2.5 text-sm text-slate-300 transition-colors hover:text-white disabled:opacity-60"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </Card>
+      )}
+
+      <Card title="Account management" subtitle="Permanently delete your account and all associated data">
+        <AlertDialog>
+          <AlertDialogTrigger asChild>
+            <button className="flex items-center gap-2 rounded-lg border border-[#FF6B6B]/30 bg-[#FF6B6B]/10 px-4 py-2.5 text-sm font-medium text-[#FF6B6B] transition-colors hover:bg-[#FF6B6B]/20">
+              <Trash2 className="h-4 w-4" /> Delete Account
+            </button>
+          </AlertDialogTrigger>
+          <AlertDialogContent className="border-white/10 bg-[#0F1F35]">
+            <AlertDialogHeader>
+              <AlertDialogTitle className="text-white">Delete Account?</AlertDialogTitle>
+              <AlertDialogDescription className="text-slate-400">
+                This will permanently delete your account and all associated data including imported reports,
+                occupancy records, revenue figures, clerk shift logs, and commission settings. This action cannot
+                be undone. You will lose access to all historical hotel data and analytics.
+              </AlertDialogDescription>
+              <input
+                type="text"
+                value={deletePhrase}
+                onChange={(e) => setDeletePhrase(e.target.value)}
+                placeholder="Type DELETE to confirm"
+                className="mt-3 w-full rounded-lg border border-white/10 bg-[#0A1628] px-3 py-2 text-sm text-slate-200 outline-none focus:border-[#FF6B6B]"
+              />
+              {deleteError && <p className="mt-2 text-sm text-[#FF6B6B]">{deleteError}</p>}
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel className="border-white/10 bg-[#0A1628] text-slate-300 hover:bg-[#1a2a40] hover:text-white">
+                Cancel
+              </AlertDialogCancel>
+              <AlertDialogAction
+                onClick={handleDeleteAccount}
+                disabled={deletePhrase !== "DELETE" || deleting}
+                className="bg-[#FF6B6B] text-white hover:bg-[#e55555] disabled:opacity-50"
+              >
+                {deleting ? "Deleting…" : "Yes, delete everything"}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </Card>
+
+{/* MFA Setup Dialog */}
+      {mfaSetupOpen && mfaSecret && mfaUri && (
+        <DialogPrimitive.Root open={mfaSetupOpen} onOpenChange={handleMfaSetupCancel}>
+          <DialogPrimitive.Portal>
+            <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0" />
+            <DialogPrimitive.Content 
+              className="fixed inset-0 z-50 flex items-center justify-center p-4 outline-none pointer-events-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"
+              aria-describedby={undefined}
+            >
+              <div className="w-full max-w-md bg-[#0F1F35] rounded-xl border border-white/10 overflow-hidden pointer-events-auto">
+                <div className="p-6 space-y-6">
+                  <div className="text-center">
+                    <DialogPrimitive.Title className="sr-only">Set Up Authenticator App</DialogPrimitive.Title>
+                {mfaAction === 'enable' && (
+                  <>
+                    <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-emerald-500/10">
+                      <Shield className="h-6 w-6 text-emerald-400" />
+                    </div>
+                    <h3 className="text-lg font-semibold text-white">Set Up Authenticator App</h3>
+                    <p className="mt-1 text-sm text-slate-400">Scan the QR code to enable two-factor authentication</p>
+                  </>
+                )}
+              </div>
+
+              <div className="space-y-4">
+                <div className="flex justify-center">
+                  <div className="bg-white p-4 rounded-lg border">
+                    <canvas ref={qrCanvasRef} className="mx-auto" />
+                  </div>
+                </div>
+
+                {qrError && (
+                  <p className="text-center text-xs text-[#FF6B6B]">
+                    The QR code could not be drawn ({qrError}). Enter the secret key below into your authenticator app instead — it enrols the same account.
+                  </p>
+                )}
+
+                <div className="text-center text-sm">
+                  <p className="text-muted-foreground">Or enter this secret key manually:</p>
+                  <code className="block mt-1 font-mono text-xs text-slate-300 bg-slate-800 px-2 py-1 rounded break-all">{mfaSecret}</code>
+                </div>
+
+                <Alert className="border-amber-500/30 bg-amber-500/10">
+                  <AlertDescription className="text-sm flex items-center gap-2">
+                    <span className="flex-shrink-0">⚠</span>
+                    <strong>Save backup codes!</strong> You'll receive 10 one-time backup codes after verification. Store them securely — each can only be used once.
+                  </AlertDescription>
+                </Alert>
+
+                <div className="space-y-3">
+                  <Label htmlFor="mfa-token" className="text-sm font-medium">Enter the 6-digit code from your app</Label>
+                  <div className="relative">
+                    <Smartphone className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+                    <Input
+                      id="mfa-token"
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      maxLength={6}
+                      placeholder="000000"
+                      onChange={(e) => {
+                        const val = e.target.value.replace(/\D/g, '').slice(0, 6);
+                        if (val.length === 6) handleMfaSetupComplete(val);
+                      }}
+                      className="h-12 pl-10 text-2xl tracking-widest text-center"
+                      autoFocus
+                      autoComplete="one-time-code"
+                      disabled={mfaVerifying}
+                    />
+                  </div>
+                  <Button 
+                    className="w-full h-12" 
+                    onClick={() => {}}
+                    disabled={mfaVerifying}
+                  >
+                    {mfaVerifying ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Verifying...
+                      </>
+                    ) : (
+                      "Verify & Enable MFA"
+                    )}
+                  </Button>
+                </div>
+
+                <Button variant="outline" className="w-full" onClick={handleMfaSetupCancel}>
+                  Cancel
+                </Button>
+              </div>
+              </div>
+            </div>
+          </DialogPrimitive.Content>
+        </DialogPrimitive.Portal>
+      </DialogPrimitive.Root>
+      )}
+    </div>
+  );
+}

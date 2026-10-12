@@ -1,0 +1,25 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Cloudflare parses public/_headers line-by-line at the edge, so a CR would be
+# captured inside every header VALUE instead of being discarded as whitespace.
+# `* text=auto` above would otherwise check this file out as CRLF on Windows.
+# Asserted by scripts/probe-deploy-config.mjs section 11.
+public/_headers text eol=lf
+
+# .env.production is committed (see .gitignore) and is parsed by dotenv inside
+# Vite's loadEnv. Pinned to LF so a Windows checkout cannot hand the parser
+# `true\r`: the env guard compares against the exact string "true", so a captured
+# CR would fail the build instead of shipping anything wrong — but a build that
+# fails only on Windows is still a trap worth removing.
+.env.production text eol=lf
+
+# .githooks/pre-commit is a `#!/bin/sh` script, and `* text=auto` above checks it
+# out as CRLF on Windows: `git add` printed "LF will be replaced by CRLF the next
+# time Git touches it" when it was first staged, 2026-09-05. A CR captured in the
+# shebang line is handed to the kernel as part of the interpreter path, so the hook
+# fails to execute rather than failing a gate — the quiet direction. It is also the
+# only file in the tree required to stay byte-identical to an untracked twin
+# (.git/hooks/pre-commit, which .git/ keeps out of the repository), and CRLF
+# normalization would break that comparison on Windows checkouts alone.
+.githooks/pre-commit text eol=lf

@@ -1,0 +1,105 @@
+{
+  "properties": {
+    "username": {
+      "type": "string"
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "role": {
+      "type": "string",
+      "description": "Highest privilege in the app. `owner` (app admin) and `admin` (manager) bypass per-property restrictions; the remaining roles are restricted to `property_access`.",
+      "enum": [
+        "owner",
+        "admin",
+        "manager",
+        "front_desk",
+        "accountant",
+        "read_only",
+        "user"
+      ]
+    },
+    "property_access": {
+      "type": [
+        "string",
+        "array"
+      ],
+      "description": "Which properties this user may view or edit. \"all\" (or null) = unrestricted; an array of property IDs restricts access. Anything else (or an empty array) grants no property access.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "description": "Optional per-feature capability flags (e.g. { \"import\": true, \"delete\": false })",
+      "properties": {}
+    },
+    "is_active": {
+      "type": "boolean",
+      "description": "Disabled users cannot sign in or use sessions."
+    },
+    "is_locked": {
+      "type": "boolean",
+      "description": "Locked users are forced through the admin unlock flow."
+    },
+    "must_change_password": {
+      "type": "boolean",
+      "description": "Forced password change on next login (temp passwords)."
+    },
+    "mfa_enabled": {
+      "type": "boolean",
+      "description": "Whether a second factor is required at sign-in."
+    },
+    "email_confirmed": {
+      "type": "boolean",
+      "description": "Whether the email address has been verified."
+    },
+    "password_hash": {
+      "type": "string",
+      "description": "SCrypt hash (never the plaintext password)."
+    },
+    "salt": {
+      "type": "string"
+    },
+    "mfa_secret": {
+      "type": "string",
+      "description": "TOTP secret (base32) used for authenticator apps. Kept server-side only."
+    },
+    "mfa_secret_pending": {
+      "type": "string",
+      "description": "Temporary TOTP secret during setup before verification."
+    },
+    "mfa_last_counter": {
+      "type": "integer",
+      "description": "The last 30-second TOTP counter accepted for this account. A code stays valid across a +/-1 window (about 90 seconds), so without recording which counter was spent an accepted code could be presented again and accepted again. Compared as a strict lower bound by every TOTP verifier."
+    },
+    "reset_token_hash": {
+      "type": "string",
+      "description": "Hashed single-use password-reset token."
+    },
+    "reset_token_expires_at": {
+      "type": "string",
+      "description": "ISO date-time when the reset token expires."
+    },
+    "last_login": {
+      "type": "string"
+    },
+    "failed_login_count": {
+      "type": "integer"
+    },
+    "locked_until": {
+      "type": "string"
+    },
+    "session_created": {
+      "type": "string"
+    },
+    "session_expires": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "username"
+  ],
+  "name": "User",
+  "type": "object"
+}

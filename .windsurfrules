@@ -1,0 +1,14 @@
+# BOSTON PROJECT — WINDSURF ADAPTER (DIVYESH-V3)
+
+Canonical engineering policy:
+- docs/engineering/AGENT_RULES.md
+
+Startup:
+- Read PROTECTED_FILES.md.
+- Run `npm run verify:v3`.
+- Read BRAIN.md and only the relevant spoke.
+- Follow the V3 router and selected packs.
+- Use `npm run typecheck`; do not substitute bare `npx tsc --noEmit`.
+
+This file is an adapter only. Do not duplicate architecture, security, business, or
+verification policy here; those contracts live in the canonical repository documents.

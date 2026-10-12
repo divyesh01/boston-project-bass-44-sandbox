@@ -1,0 +1,1180 @@
+# 7. ALL 16 DATABASE TABLES (Entities)
+
+Every piece of data stored. Each table has Row-Level Security (RLS) = data isolated per property/user.
+
+### The Canonical RLS Rule (read AND write must be byte-identical)
+
+10 of the 16 entities are property-scoped. Identify them by the `{{user.property_access}}`
+marker, never by a hardcoded list, so a new entity is covered automatically.
+
+```json
+{ "$and": [ {"user_condition":{"is_active":true}},
+            {"$or":[ {"user_condition":{"role":"admin"}},
+                     {"user_condition":{"role":"owner"}},
+                     {"data.property_id":{"$in":"{{user.property_access}}"}} ]} ] }
+```
+
+The operator ORDER is the whole security boundary, and both ways of getting it wrong are
+silent, because RLS is enforced by the **Base44 host** -- no local suite can observe it:
+
+| Corruption | Effect |
+|-----------|--------|
+| Inner `$or` flipped to `$and` | Demands one user be admin AND owner simultaneously. Nobody can read. Table looks empty. |
+| Outer `$and` flipped to `$or` | ANY active user passes regardless of role or property. **Cross-property data leak.** |
+
+**Fixed 2026-08-19:** `fix_entities.py` did a naive positional string replacement and left 9
+entities (`ClerkShiftRecord`, `Expense`, `OccupancyDay`, `PaymentDay`, `PayrollRun`,
+`SourceDay`, `Staff`, `TimecardPunch`, `UploadedReport`) with the sequence
+`[$and,$and,$or,$or]` instead of `[$and,$or,$and,$or]`. `GrossRevenueDay.jsonc` was the
+surviving healthy reference. Guarded by `scripts/probe-db-mock-rls.mjs`, which does not
+merely diff the JSON -- it EXECUTES every shipped rule against a 9-case access matrix
+(180 assertions), including the cross-property deny that SECURITY.md section 3 requires.
+
+### Core Tables
+| Entity | File | What It Stores | Who Can Access |
+|--------|------|---------------|---------------|
+| **User** | `User.jsonc` | Usernames, emails, display names, roles (owner/admin/manager/front_desk/accountant/read_only), property_access, granular permissions, scrypt password hashes, salts, TOTP MFA secrets, last TOTP counters, lockout flags, password reset tokens | Auth functions only |
+| **Session** | `Session.jsonc` | SHA-256 token hash, expiry timestamp, client IP, User-Agent, revocation flag | Auth functions only |
+| **Property** | `Property.jsonc` | Hotel code, name, total room count, address, phone, active status | All authenticated users |
+
+### Financial Data (Daily Records)
+| Entity | File | What It Stores |
+|--------|------|---------------|
+| **GrossRevenueDay** | `GrossRevenueDay.jsonc` | Daily departmental revenue: room rent, food, beverage, laundry, misc charges, advance deposits |
+| **PaymentDay** | `PaymentDay.jsonc` | Daily payment breakdown: cash, check, Visa, Amex, MasterCard, Discover, direct bill, wire, loyalty discounts |
+| **OccupancyDay** | `OccupancyDay.jsonc` | Daily room stats: total rooms, sold, vacant, clean, dirty, stayover, comps, no-shows, ADR, occupancy %, RevPAR |
+| **SourceDay** | `SourceDay.jsonc` | Daily booking source: revenue and stays per channel code (Expedia, Booking.com, Direct, etc.) |
+
+### Operational Data
+| Entity | File | What It Stores |
+|--------|------|---------------|
+| **Channel** | `Channel.jsonc` | OTA commission rates (type, rate, amount) and daily channel performance |
+| **ClerkShiftRecord** | `ClerkShiftRecord.jsonc` | Shift records: payments collected, cash drops, actual vs adjusted, transaction counts |
+| **Expense** | `Expense.jsonc` | Operating expenses: category, amount, frequency, payment status, taxability |
+| **Staff** | `Staff.jsonc` | Employee roster: department, role, pay type (hourly/salary), rates, hire date |
+| **TimecardPunch** | `TimecardPunch.jsonc` | Raw time punches: clock-in/out, break minutes, department |
+| **PayrollRun** | `PayrollRun.jsonc` | Finalized payroll: hours, regular/OT pay, bonuses, deductions, approval status |
+| **UploadedReport** | `UploadedReport.jsonc` | Upload metadata: file URL, row counts, Drive backup ID, backup status |
+
+### Security & System
+| Entity | File | What It Stores | Special Rules |
+|--------|------|---------------|--------------|
+| **AuditLog** | `AuditLog.jsonc` | Every security event: action, user_id, performed_by, IP, device, property_id, result, detail, SHA-256 hash, previous_hash | **APPEND-ONLY** (update: false, delete: false) |
+| **RateLimit** | `RateLimit.jsonc` | Brute-force buckets: client IP/account key, action (login/reset/mfa), attempt count, reset timestamp | Used by login, reset, MFA verification |
+
+---
+
+# 8. ALL 19 BACKEND FUNCTIONS (The Server Brain)
+
+### Authentication (8 functions)
+| Function | Folder | What It Does | If You Edit This... |
+|----------|--------|-------------|-------------------|
+| **Login** | `custom_auth_login/` | Rate limiting (5/15min per IP), scrypt verify (auto-upgrades legacy PBKDF2), TOTP MFA with counter replay prevention, session creation, HTTP-only Secure cookie, audit log | Login breaks for ALL users |
+| **Logout** | `custom_auth_logout/` | CSRF token validation, session revocation, cookie clearing | Users cannot log out (sessions persist) |
+| **Me** | `custom_auth_me/` | Returns sanitized user profile, slides session expiry (7d, max 30d) | Premature logout, profile fails to load |
+| **Check** | `custom_auth_check/` | Fast session validation (no sliding): token hash, revocation, user status | App cannot verify login state |
+| **Register** | `custom_auth_register/` | Owner bootstrap (when 0 owners exist), admin-only subsequent registration, scrypt hash, welcome email with reset link | Registration breaks |
+| **Reset Request** | `custom_auth_reset_request/` | Dual rate-limit (IP + email), 1-hour token, generic response (anti-enumeration) | Reset emails stop, or flooding attacks possible |
+| **Reset Password** | `custom_auth_reset_password/` | Token validation, password complexity (8+ chars, upper/lower/number), revoke all sessions | Password resets fail, weak passwords accepted |
+| **User Admin** | `custom_user_admin/` | Full CRUD, MFA mgmt (with step-up password), status toggle, session revocation on privilege change, chained audit | User management breaks entirely |
+
+### Audit Trail (4 functions)
+| Function | Folder | What It Does | If You Edit This... |
+|----------|--------|-------------|-------------------|
+| **Log** | `audit_log/` | SHA-256 HMAC: canonical payload + previous hash + AUDIT_CHAIN_SECRET | Audit chain breaks -- tampering goes undetected |
+| **Verify** | `audit_verify/` | Walks entire log, recomputes hashes, detects tampering/deletion | Cannot verify audit integrity |
+| **List** | `audit_list/` | Admin-only filtered query with property access enforcement | Audit page shows nothing |
+| **Clear** | `audit_clear/` | **ALWAYS returns HTTP 403** -- audit can NEVER be cleared | If changed: entire audit trail can be destroyed |
+
+### Business Operations (4 functions)
+| Function | Folder | What It Does | If You Edit This... |
+|----------|--------|-------------|-------------------|
+| **AI Assistant** | `aiAssistant/` | Tenant-scoped AI: validates session, enforces property boundaries, anti-jailbreak prompts, queries Base44 LLM | AI leaks cross-property data |
+| **Auto Payroll** | `autoPayroll/` | Monthly payroll (last day): reconcile timecards, 40h overtime threshold, 30m break rules, create PayrollRun | Employees paid wrong or double-paid |
+| **Delete Account** | `deleteAccount/` | Requires explicit "DELETE:<userId>" confirmation, wipes data across 5 entities | Accidental mass data deletion |
+| **Get Weather** | `getWeather/` | Proxy to OpenWeather API (hides API key from browser) | Weather widget breaks |
+
+### External Integrations (3 functions)
+| Function | Folder | What It Does | If You Edit This... |
+|----------|--------|-------------|-------------------|
+| **Backup to Drive** | `backupToDrive/` | SSRF-safe file download, hierarchical Drive folders, upload + update UploadedReport | Drive backups fail or SSRF vulnerability |
+| **Import Drive File** | `importDriveFile/` | Downloads from Drive via OAuth, IDOR defense (tenant property check) | Drive import breaks or cross-tenant leak |
+| **List Drive Files** | `listDriveFiles/` | Lists CSV/spreadsheet files from connected Google Drive | Drive file picker breaks |
+
+### Fixed 2026-09-29: Property isolation and timecard selection in autoPayroll
+
+In `base44/functions/autoPayroll/entry.ts`, active staff were loaded globally without property scoping, and runs were created without applying `body.propertyId`. As a result, a request for Property A could create payroll runs for Property B staff using hand-typed hours, and timecards were not properly scoped by property.
+
+**Fix:**
+1. Scoped staff query and memory filter by `body.propertyId` when provided.
+2. Scoped `TimecardPunch` and `PayrollRun` queries by property ID.
+3. Scoped `reconcileTimecards` grouping and `byEmployee` lookup by property ID so timecard punches are strictly matched to the employee at that specific property.
+4. Added an explicit property boundary check in the run creation loop ensuring runs are only created for the requested property.
+
+Covered by two-property regression tests in `tests/backend/autoPayroll.test.js` and `src/api/autoPayroll.test.js`.
+
+### Fixed 2026-09-29: property_access fail-open in importDriveFile
+
+`entry.ts` around line 60 used `!Array.isArray(user.property_access)` as part of the
+bypass guard. That expression is `true` for `undefined`, `null`, arbitrary strings, and
+plain objects — so any user whose `property_access` was missing or malformed silently
+became unrestricted (null allowlist) and could reach any property's Drive files without
+a grant.
+
+**Fix:** the bypass now requires an explicit one of three conditions:
+1. `user.role === 'owner'` — full platform access by design
+2. `user.role === 'admin'` — full platform access by design
+3. `user.property_access === 'all'` — explicit grant recorded at user creation
+
+All other values (including `undefined`, `null`, wrong strings, objects) produce an
+empty allowlist `[]`, so every `allowedPropertyIds.includes(...)` call fails closed.
+This matches the pattern in `custom_user_admin/entry.js:300-303` and
+`importGoogleSheet/entry.js:384-388`.
+
+Covered by 16 tests in `tests/backend/importDriveFile.test.js` (three groups:
+no-grant → 403, scoped-array-excludes → 403, authorized → 200).
+
+### Fixed 2026-09-29: Authorization hardening in listDriveFiles & Centralized Auth Probe
+
+`base44/functions/listDriveFiles/entry.ts` lacked permission and property-access verification:
+any authenticated user could list the organization's Google Drive files, even if their role
+prohibited report importing (e.g. `read_only`, `accountant`) or if they had zero property grants.
+
+**Fix:**
+1. Hardened `listDriveFiles/entry.ts` with explicit `import_reports` permission checks and fail-closed property access checks (`property_access === 'all'` or non-empty assigned property array required for non-root callers).
+2. Created `base44/utils/auth.js` providing centralized `resolvePropertyScope`, `isPropertyAuthorized`, `hasPermission`, and `validateCsrf`.
+3. Created static security analysis probe `scripts/probe-auth-uniformity.mjs` verifying all 19 serverless functions against fail-open anti-patterns, incomplete session checks, and missing CSRF on mutating endpoints (81 assertions).
+4. Documented authoritative security contracts in `docs/AUTHORIZATION.md`.
+
+Covered by 15 tests in `tests/backend/listDriveFiles.test.js`, 18 tests in `tests/backend/authUtils.test.js`, and 81 assertions in `scripts/probe-auth-uniformity.mjs`.
+
+### Fixed 2026-08-19: the `__B44_DB__` fake-database shim
+
+Seven of these functions (`aiAssistant`, `autoPayroll`, `backupToDrive`, `deleteAccount`,
+`getWeather`, `importDriveFile`, `listDriveFiles`) each opened with an injected line:
+
+```js
+const db = globalThis.__B44_DB__ || { entities: {...}, auth: { me: async () => null } };
+```
+
+whose methods returned `[]` / `null` / `{}`. So **every read returned "no rows" and every
+write was silently discarded.** `getWeather` returned 401 for everyone; two
+`AuditLog.create` calls went nowhere. Nothing caught it for months because
+`eslint.config.js` ignores `base44/**` entirely and `jsconfig.json`'s `include` is `src/**`
+only -- **`base44/**` is checked by NO automated tooling except the probes.**
+
+Origin was `AGENTS.md` line 1, which carried the same statement above its own heading: an
+agent reads its own rulebook and copies line 1 as the house way to query the database. The
+same codemod also broke `public/manifest.json` (one prepended JS line made `JSON.parse`
+fail, so browsers discarded the entire manifest and it shipped that way in `dist/`).
+
+Two traps when repairing this class of defect:
+
+- Preserve each author's elevation intent -- `db.asServiceRole.X` -> `base44.asServiceRole.X`,
+  bare `db.X` -> `base44.X`. Do NOT blanket-elevate.
+- `autoPayroll` never had an SDK client in ANY revision, so a mechanical `db.` -> `base44.`
+  rename leaves it broken. It needed `createClientFromRequest` added, and its call sites
+  deliberately elevated to `asServiceRole` because a scheduled cron run has no session
+  cookie and would be denied by the very RLS rules being repaired.
+
+`autoPayroll` and `deleteAccount` are now WRITERS on the audit chain (see BRAIN_SECURITY.md).
+
+### Fixed 2026-08-22: one SDK specifier across all 18 functions
+
+Every function imports the SDK by a Deno specifier that carries its own version
+range. Until now the repository held **two** ranges: the 7 `.ts` functions pinned
+`npm:@base44/sdk@0.8.40` and the 11 `.js` functions `npm:@base44/sdk@^0.8.41`.
+`package.json` declares `^0.8.41`, so the exact pin named a version nothing else
+in the repository asked for. All 18 now read `npm:@base44/sdk@^0.8.41`.
+
+This had been deferred twice on a misreading, which is the part worth recording.
+`custom_auth_login/entry.js:204` and `custom_user_admin/entry.js:311` carry a
+warning that copies must stay byte-identical — **that warning is about the
+canonical audit field list (`AUDIT_CANONICAL_V1`), not about the import line.**
+Read as covering line 1, it froze the split in place.
+
+Why the split was a real hazard rather than untidiness: `autoPayroll/entry.ts` and
+`deleteAccount/entry.ts` are audit-chain writers (previous paragraph), so two
+functions were appending to **one hash chain** through a different SDK build from
+every other writer. The `.ts` functions use exactly one export between them,
+`createClientFromRequest`, which is present in 0.8.41 — checked against
+`node_modules/@base44/sdk/dist/client.d.ts`, not assumed.
+
+Blast radius, because this specifier is a **string key** in three other places and
+a mechanical rename orphans all three:
+
+```
+vitest.config.js                     resolve.alias key   -> stale alias deleted
+tests/backend/aiAssistant.test.js    vi.mock() specifier -> updated
+tests/backend/all_endpoints.test.js  vi.mock() specifier -> two mocks collapsed to one
+```
+
+A missed `vi.mock` does not fail loudly. The mock simply stops intercepting the
+module the function imports and the test reaches the **real** SDK. All three were
+updated in the same change; `vitest run tests/backend` is 24/24.
+
+`scripts/probe-no-real-credentials.mjs:104,286` still contain the literal string
+`npm:@base44/sdk@0.8.40` and must be **left alone** — they are regex fixtures
+asserting a version specifier is not misread as an email address.
+
+```
+node --import ./scripts/_loader-boot.mjs scripts/probe-audit-chain.mjs   # 36/0
+npx vitest run tests/backend                                            # 24/24
+```
+
+### Fixed 2026-08-22: `base44/lib/corsConfig.js` — two defects in a file nothing imports
+
+`python -m graphify query "corsConfig"` returns **6 nodes, all inside this one file, and
+no inbound edge from anywhere in the repository.** It is an orphan. Both defects below
+were therefore latent, never observed at runtime — which is precisely why they needed a
+static guard rather than a bug report. An unused file generates no runtime evidence, so
+the person who discovers its defects is whoever wires it into a function first.
+
+**Defect 1 — `process.env` at module scope.** Line 19 was
+`const productionOrigins = process.env.ALLOWED_ORIGINS ? ... : []`. A bare `process`
+reference throws `ReferenceError` **at import time** in any host that does not define it:
+a browser/Vite bundle, or a Deno function running without the Node compatibility global.
+For a CORS module that is the worst available failure mode — it takes down the endpoint it
+was added to protect, before a single request is inspected. Now read lazily and memoised
+through `readEnv()`, which tries `Deno.env.get` first (base44 functions run on Deno),
+falls back to `process.env`, and treats a `Deno.env.get` permission throw as "unset"
+rather than propagating it.
+
+`allowedOrigins` and `productionOrigins` are now **getters** on `module.exports`. Exporting
+them as plain arrays would have re-introduced the module-scope evaluation the fix removes,
+while looking harmless.
+
+**Defect 2 — the preflight wildcarded unauthorized origins.** The `OPTIONS` branch read
+`res.header('Access-Control-Allow-Origin', isAllowedOrigin(origin) ? origin : '*')`, so an
+origin the module was about to reject got a wildcard grant plus the full
+`GET, PUT, POST, DELETE, OPTIONS` method list. That contradicts the file's own header
+contract ("Rejects unauthorized origins with HTTP 403"). Practical exposure was limited —
+the follow-up request was still 403'd below, and browsers refuse `*` together with
+credentials — but it failed safe by *browser behaviour*, not by design. Unauthorized
+preflights now get the same 403 as unauthorized requests.
+
+**Deliberately NOT changed**, so nobody "finishes the job" by accident:
+
+- The `else if (isProductionOrigin(origin))` branch is **unreachable**. `allowedOrigins`
+  already contains every production origin, so `isAllowedOrigin` is true first. Pre-existing
+  dead code, harmless, left alone.
+- The file is **CommonJS** (`module.exports`) and **Express-shaped** (`res.header`,
+  `next()`). A Deno serverless function under `base44/functions/` cannot import it as-is.
+  That is the real reason it is dead, and converting it is a port, not a fix — do that only
+  when something actually needs it.
+
+`scripts/probe-cors-config.mjs` guards both defects, 35 assertions. It loads the module
+inside a bare `vm` context rather than with `import()`, because Node always defines
+`process` and an `import()`-based test therefore *cannot* observe the crash the fix
+prevents. Its static assertions run against comment-stripped source: the fix documents
+itself by quoting the defective lines, and a naive substring search finds the old wildcard
+in the comment saying it is gone (the same trap produced a false FAIL in
+`verify-money-kept.mjs` the same day).
+
+Both halves were mutation-tested, so no assertion is vacuous: against `HEAD`'s pre-fix
+source **7 assertions fail** (including "module evaluates without throwing", which is
+direct proof the `ReferenceError` was real); against a mutant restoring **only** the
+preflight wildcard, **5 fail**.
+
+```
+node scripts/probe-cors-config.mjs        # 35/0, standalone — no loader needed
+```
+
+---
+
+# 9. ALL CONFIG FILES
+
+### Production Worker authentication (2026-09-01)
+
+- `wrangler.jsonc` now routes `/api/*` through `worker/index.js`, binds
+  `boston-project-production-auth`, and keeps `ENABLE_D1_DATA_API=false`.
+- `.env.production` selects `VITE_USE_SERVER_AUTH=true` and
+  `VITE_USE_D1_API=false`. Authentication is server-backed; hotel/business
+  entities remain browser-local IndexedDB.
+- Password records use the versioned
+  `$rri-pbkdf2-sha256$v=1$i=100000$p=1$...` contract plus the
+  `PASSWORD_PEPPER_V1` Cloudflare secret. Legacy/unknown formats fail closed.
+- `app_session` and `app_mfa_challenge` are the browser-independent session
+  and single-use MFA stores. D1 stores token digests, never bearer cookies.
+- `/api/session` derives the frontend route-capability baseline for `owner` and
+  `admin` from their authoritative server role, then applies any stored
+  permission overrides. This prevents a provisioned owner whose legacy
+  `permissions` JSON is `{}` from being authenticated but trapped in a blank
+  same-path `/` permission redirect. Non-owner roles receive no elevated
+  defaults from this boundary.
+- Owner migration is compare-and-swap and profile-preserving; provisioning and
+  migration scripts never persist plaintext passwords. New-owner provisioning
+  stores the same complete owner capability map returned by the session API.
+- Property deletion in the browser walks 24 dependent IndexedDB tables.
+  `propertyCascadeIds` handles numeric/string legacy ids without deleting a
+  separately owned cross-type property.
+- Production Worker `6b04c93d-f5e4-4de7-9832-357a8aeffee5` includes the
+  permission-bootstrap incident repair. Its pre-change rollback target is
+  `623b3ee9-6815-43fb-a70c-1c1cdea0a2c8`; the earlier authentication rollout
+  passed the 22-check live smoke.
+
+### Cross-browser business-data sync rollout (2026-09-02, enabled)
+
+- `VITE_USE_SERVER_DATA_SYNC` (build time, `.env.production`) and the independent
+  Worker kill switch `ENABLE_BUSINESS_SYNC_API` (`wrangler.jsonc`) are both
+  `true` as of this rollout. They must move together: a client with sync on
+  against a Worker with the API off receives `404 {"error":"business-data sync is
+  disabled"}`, which carries no `no_active_dataset` code, so `requestOptional`
+  rethrows instead of falling back to the cache. `ENABLE_D1_DATA_API` remains
+  `false` — the legacy per-request entity API is a different path and is not
+  needed by this one.
+- Production D1 `boston-project-production-auth` has `0002_business_sync.sql`
+  applied (Observed 2026-09-02: `d1_migrations` = `0001_auth_schema.sql`,
+  `0002_business_sync.sql`; 11 `business_*` tables; 7 `idx_business*` indexes;
+  users 1, accounts 1, properties 0, grants 0, sessions 2 — all unchanged across
+  the migration). Schema migration is not dataset activation: `business_dataset`,
+  `business_dataset_pointer`, `business_record` and `business_sync_state` were
+  all left at zero rows, so the account has no active generation.
+- Enabling the flags cannot clear a browser's existing data. The only
+  `.clear()` in `src/api/businessSync.js` is inside `hydrate()`'s snapshot path
+  (line 310) and is unreachable while `fetchSnapshot()` returns `null`, which is
+  exactly what happens when the server answers `404 no_active_dataset` (line
+  305 returns first). `applyFeed` never clears; it only requests a rebuild.
+- An active-but-empty generation — the one state that would clear a cache and
+  write nothing back — cannot be created. `startMigration` rejects a manifest
+  whose entity totals are `<= 0` (422) and `activateMigration` refuses a
+  generation with no property roster (422), with a chunk count/hash that does not
+  match the manifest (409), with a total record count that does not reconcile
+  (409), with any per-entity count that does not reconcile (409), or with an
+  orphaned `property_key` reference (422) — one that names an *absent* property,
+  which is not the same as the account-global key that names *no* property (see
+  the next bullet). The pointer swap, the roster upsert and the previous-generation
+  retirement all run in one `env.DB.batch()`.
+- **A business record with no property is account-global, not orphaned**
+  (2026-09-03). The typed-key encoder spells that exactly one way: `s:0:`, from
+  `typedRecordKey("")`. No *other* id can reach that spelling — every non-empty
+  string id yields `s:<len>:` with `len > 0`, and a numeric id `0` yields `n:0`,
+  which is a *real* property id. The sentinel is nonetheless IN-BAND, because a
+  `Property` whose own id is `""` encodes to `s:0:` as well; that collision is
+  refused, not prevented by the format, and the three refusals are enumerated in
+  `BRAIN_SECURITY.md` §18. An empty `property_key` on the wire — the field absent,
+  not the string `s:0:` — is an omitted field, never global. Such a
+  record activates with `server_property_id` left SQL NULL and gets no
+  `business_property_map` row and no sentinel roster row; activation's
+  property-key `UPDATE` is keyed by a mapped key, so it never touches it. This is
+  the write half of a read path that already handled NULL: `scopedRecordClause`
+  emits `1=1` for `scope.all` and `server_property_id IN (…)` for a restricted
+  caller, which SQL NULL never matches. `property_key` is covered by three hashes
+  (the migration chunk hash, the transaction chunk hash and the `mutate` request
+  hash), so it is **never normalized server-side** — only compared against one
+  named constant, at all four sites that resolve a key to a server property id.
+  Observed 2026-09-03: production's single staged generation holds 16 such rows,
+  14 `PayrollRun` and 2 `Staff`, produced by posting historical payroll while the
+  global property filter is `all`. No `TransactionLine`, `GrossRevenueDay`,
+  `OccupancyDay` or `PaymentDay` row is property-less, so the cent-exact revenue
+  reconciliation is untouched by this contract.
+- `business_staging_target.server_property_id` is `NOT NULL`, so the staged
+  transaction path cannot store NULL there and binds the sentinel
+  `__account_global__` in that one insert. `business_record` and `business_change`
+  keep a real NULL. The sentinel never persists — staging targets are deleted on
+  commit and on abort — and it grants nothing: the commit-time scope guard admits
+  it only through its two unrestricted arms, and both the SQL guard and its JS
+  fallback state that explicitly rather than relying on the fact that no
+  `user_property_access` row can name it. Chosen over a live DDL migration because
+  that table has no foreign key to `property` and the sentinel's lifetime is one
+  transaction. A chunk whose operations are *all* global leaves the property-key
+  list empty, and `property_key IN ()` is a SQLite syntax error, so that lookup is
+  skipped rather than built.
+- The implementation stages complete 25-entity IndexedDB snapshots in
+  immutable account-scoped D1 generations, preserves numeric versus string ids,
+  verifies chunk hashes/counts, and exposes data only through an atomic active
+  generation pointer. Clean browsers rebuild IndexedDB as a cache from a fixed
+  snapshot revision plus a monotonic change feed.
+- Online single-record writes are server-first, mutation-idempotent, guarded by
+  the previous row hash, property scoped, and retained in a durable browser
+  outbox across ambiguous response loss. Offline business writes remain blocked.
+  Property deletion forces a full cache rebuild. Employee-id sequences are
+  reserved by account on the server when sync mode is active.
+- Active-generation rollback restores the previous property roster in the same
+  D1 batch as the pointer swap. Replacement-only properties are deactivated,
+  not deleted, because deleting them would cascade authorization grants.
+- The `runInTransaction` release blocker is resolved locally for report import,
+  manual-entry save, and payroll bulk posting. The client captures mutations in
+  a read-your-writes overlay without changing business IndexedDB tables, then
+  sends idempotent 13-operation chunks through explicit
+  `start`/`chunk`/`commit`/`abort`/`status` endpoints. Import rollback ids are
+  durably deferred until the authoritative commit is confirmed and hydrated.
+- Each transaction clones the active immutable generation, records the active
+  generation and account revision, and atomically swaps the pointer only after
+  live authorization, property scope, revision, pointer, expiry, and pending
+  state all pass inside the D1 batch. Abort, expiry, and conflict paths remove
+  staging rows, targets, chunk receipts, and mutation guards; ambiguous responses
+  retain the browser outbox until status proves commit or a pending attempt is
+  explicitly aborted. Concurrent start/chunk/commit retries are idempotent.
+- Every destructive staging cleanup batch — abort, the expiry sweep, and the
+  commit conflict rollback — carries a `${tx_id}:cleanup` guard row that requires
+  the transaction to still be `pending` (and, for the sweep, still expired) at
+  batch-execution time. The pre-batch status read is a check-then-act window: a
+  commit that wins that race publishes the staging generation as the active
+  dataset, so an unguarded cleanup would delete the live dataset's records and
+  property map and still return success. The `CHECK (ok = 1)` column turns a lost
+  race into a rolled-back batch, and abort then reports `transaction_not_pending`
+  instead of destroying authoritative data. Cleanup must never widen to
+  unconditional deletes on a generation id that a concurrent commit can activate.
+- `activeTransaction` in `src/api/businessSync.js` is module-scoped by design.
+  The browser has no async context propagation, so a UI write issued while a
+  transaction callback awaits is captured into that open transaction instead of
+  racing it. The alternative — letting the concurrent write reach the server
+  first — bumps the account revision and makes the whole staged import fail the
+  commit CAS, losing far more work than it protects. Callers must not start a
+  transaction around long-lived interactive flows.
+- `ensureFresh` in `src/api/businessSync.js` coalesces concurrent readers onto a
+  single in-flight pull. Every wrapped read (`filter`, `list`, `paginate`,
+  `count`, `get`) awaits it first, so its contract is that it resolves only once
+  the local cache is authoritative. A time-only throttle broke that contract: it
+  armed `lastPullAt` before the snapshot download finished, so a second widget
+  mounting in the same tick took the early return and rendered the pre-hydration
+  cache — empty on a clean browser — while the server held the data. That is
+  exactly the upload-once cross-browser case this subsystem exists to serve.
+  Waiters now join the shared `pullPromise`, and the throttle is armed only after
+  `hydrate()` resolves. `hydrate()` resolves for a completed swap, for an offline
+  fall back to a usable prior cache, and for an inactive dataset, and throws only
+  when no usable cache exists, so a failed cold pull stays immediately retryable
+  instead of throttling the next reader into a silent empty result. No `await`
+  may be introduced between the `pullPromise` check and its assignment; that
+  reopens the double-pull race the join closes.
+- Treating a 404 from `transaction/status` as "never started" is safe because the
+  worker never deletes `business_staging_transaction` rows — every terminal state
+  is an `UPDATE` to `committed`, `aborted`, `expired`, or `conflict`. A committed
+  transaction can therefore never answer 404, so recovery dropping an outbox
+  entry on 404 cannot discard a committed write. Any future change that deletes
+  staging transaction rows would turn that recovery branch into silent data loss.
+- Current deterministic evidence: Worker sync probe 27/27 (the seven added checks
+  cover the abort race, the expiry-sweep race, later-chunk property scope,
+  commit-after-abort, staging invisibility to snapshot and feed, selective
+  expiry, and full cross-account denial), real router/auth/kill-switch probe
+  4/4, `src/api/businessSync.test.js` 21/21, full Vitest 46 files / 362 tests,
+  credential scan 15/15, `verify:v3` PASS, lint 0 errors, `npm run typecheck`
+  0 errors, production build PASS, and `verify:all` 147 suites / 146 PASS /
+  0 FAIL / 1 environment SKIP (`probe-config-exposure.mjs` needs a running Vite
+  server that mounts the Base44 serverless functions; it is an honest environment
+  skip, not a pass). Note that a bare `tsc --noEmit` is not the typecheck gate:
+  with no project argument it prints usage and exits 1, so use
+  `npm run typecheck`, which runs `tsc -p ./jsconfig.json`. Two invariants were
+  mutation-tested. Removing the abort guard reproduces `abort must fail closed
+  once the commit won, got 200`, and removing only the sweep guard fails the
+  sweep test while the abort test still passes. Replacing `ensureFresh`'s
+  `await pullPromise` join with a bare `return` reproduces the empty concurrent
+  read (`expected [] to deeply equal [ { id: 9, … } ]`), so neither check is
+  vacuous. Business sync remains disabled and undeployed; this evidence verifies
+  the local release candidate, not production readiness.
+
+### Build & Deploy
+| File | What It Does | If You Edit This... |
+|------|-------------|-------------------|
+| `package.json` | NPM deps (React 18, Base44 SDK, Recharts, Dexie, Tailwind, Radix, Framer Motion), scripts (dev, build, test, lint, ws) | Build fails, tests fail, everything |
+| `vite.config.js` | Vite build: React plugin, Base44 plugin, standalone env guard, SRI hash generator, dev security headers, console stripping, vendor chunk splitting | Production build fails |
+| `vercel.json` | Vercel deploy: SPA routing (/* -> /index.html), 1-year immutable caching for /assets/*, production security headers | 404 on refresh, security headers lost |
+| `sriPlugin.js` | Hashes every `/assets/` subresource in the built index.html. Digests are taken in `writeBundle` (the file ON DISK) and re-verified in `closeBundle`, after every other plugin has written | Move the hashing back into `transformIndexHtml` and the browser blocks the entry chunk: blank page, whole app down. See BRAIN_SECURITY "Subresource Integrity" |
+| `envGuardPlugin.js` | Accepts either the current server-auth shape (`VITE_USE_SERVER_AUTH=true`, D1 data off) or the complete legacy standalone shape | It refuses a production bundle with neither usable authentication shape |
+| `eslint.config.js` | ESLint 9: React + Hooks rules, unused import removal | Linting breaks in CI |
+| `vitest.config.js` | Test runner: JSDOM env, @/ path alias, setup hooks, coverage | Tests cannot run |
+| `tailwind.config.js` | Design tokens: HSL color vars, chart colors 1-5, sidebar colors, fonts, accordion animations | ALL styling breaks |
+| `components.json` | Shadcn UI: component paths, utility path, icon library | New UI components scaffolded wrong |
+| `jsconfig.json` | IDE: @/* -> ./src/* path alias, strict JSX, type definitions | Autocomplete and type-checking break |
+| `postcss.config.js` | PostCSS: loads Tailwind and autoprefixer | CSS processing fails |
+
+### Deploying: two paths, one worker
+
+The site is the Cloudflare Worker **`boston-project`**
+(`boston-project.divyesh-boston.workers.dev`). Two things can update it, and the `name` in
+`wrangler.jsonc` is the single line that makes them agree -- read the comment in that file
+before touching it.
+
+**Local upload.** `npm run build`, then `npx wrangler deploy`, which uploads whatever is in
+`dist/`. `.env.production` is part of the checkout, so the flags are present, the guard passes,
+and the bundle can log in.
+
+**Cloudflare Workers Builds from GitHub.** Five defects have been measured in this pipeline.
+Four came from build #2576feba (2026-08-23, on the abandoned `divyeshpro` worker); the fifth
+only became visible once the first four were addressed, on build #159d05dc (2026-08-24).
+
+| Defect | Why it breaks the deploy | State |
+|---|---|---|
+| Repo was `divyesh01/divyeshpro` | The code lives in `divyesh01/boston_project`. Pushing a fix to the repo you are reading did not reach that pipeline at all | fixed in dashboard: now `divyesh01/boston_project`, branch `main` |
+| Branch was `dependabot/npm_and_yarn/vite-8.2.2` | `npm clean-install` died with ERESOLVE: that branch bumps vite to 8.2.2 while `@vitejs/plugin-react@4.7.0` declares peer vite `^4.2.0 \|\| ^5.0.0 \|\| ^6.0.0 \|\| ^7.0.0`. A dependabot branch is not a deployable branch | fixed in dashboard, and `.github/dependabot.yml` now prevents the branch existing |
+| Deploy command was `npx wrangler versions upload` | Uploads a version WITHOUT routing production traffic to it, so a "successful" build changes nothing a visitor sees | fixed in dashboard: `npx wrangler deploy` |
+| **Build variables: None** | While `.env.production` was gitignored a Git build saw neither auth flag. Before `envGuardPlugin.js` that produced a green build and a bundle nobody could log into; after it, three builds failed in ~1s. Two dashboard attempts changed nothing -- Cloudflare has a **Runtime** "Variables and Secrets" section as well as a **Build** one, and only the Build one reaches `npm run build` | fixed here, upstream of the dashboard: `.env.production` is now committed (see Environment Variables below), so any clone builds the working shape. Build variables are no longer required for a deploy; if set, they still win (`loadEnv` merges `process.env` last) |
+| `wrangler.jsonc` `name` was `divyeshpro` | The build belongs to the `boston-project` service but its deploy command reads this file, so the two deploy paths pointed at two different workers | fixed here: `name` is `boston-project` |
+
+Build #159d05dc is the useful evidence: Initializing / Cloning / Installing all succeeded and
+the build then failed at `configResolved` in one second with
+`[standalone-env-guard] refusing to build a production bundle that cannot log anybody in.`
+That is the pipeline failing for the right reason for the first time. Cloudflare's build
+variables reach the bundle because `loadEnv` merges `process.env` keys carrying the `VITE_`
+prefix over the ones parsed from `.env` files (observed in
+`node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:16932`), so a dashboard variable and a
+line in `.env.production` are equivalent as far as the guard and the bundle are concerned.
+
+`.github/dependabot.yml` ignores semver-major bumps of `vite` and `@vitejs/plugin-react` so
+the bot stops re-opening a branch that cannot install. They are peer-coupled and have to move
+together, by hand.
+
+Two known-and-accepted weaknesses in this path: `wrangler` is not a declared dependency, so
+`npx wrangler deploy` resolves whatever version is newest at build time; and the Worker name
+can only be verified against the dashboard by eye, since nothing in the repo can observe it.
+
+### Environment Variables
+| File | Key Setting | What It Controls | DANGER |
+|------|------------|-----------------|--------|
+| `.env.example` | **committed template** | The only place the required variable names are written down, each annotated with the file:line that reads it. `.gitignore` has an explicit `!.env.example` negation so `.env.*` cannot swallow it. | Deleting it leaves a new deploy nothing to copy |
+| `.env.local` | `VITE_USE_LOCAL_AUTH=false` | Default: use real serverless auth | Loaded by Vite in **every** mode including `vite build` — never put `true` here |
+| `.env.development` | `VITE_USE_LOCAL_AUTH=true` | Dev: use local IndexedDB auth shim | - |
+| `.env.production` | `VITE_USE_SERVER_AUTH=true` + `VITE_USE_D1_API=false` + `VITE_USE_SERVER_DATA_SYNC=true` | Current production: same-origin Worker authentication, legacy entity API off, business data authoritative in D1 with IndexedDB as a cache | This committed file contains public build flags only. Never add a password, token, pepper, or other secret. `VITE_USE_SERVER_DATA_SYNC` is baked in at build time — changing it needs a rebuild AND a deploy, in step with `ENABLE_BUSINESS_SYNC_API` |
+| `PASSWORD_PEPPER_V1` | Cloudflare Worker secret (not a file) | Post-hash HMAC pepper for versioned owner credentials | Missing/short values make authentication return controlled 503; never place this value in source, logs, chat, or `.env.production` |
+| `ENABLE_D1_DATA_API` | `false` in `wrangler.jsonc` | Runtime kill switch for Worker business-data endpoints | Not part of the cross-browser sync path; leave false. `/api/entities`, `/api/import`, `/api/properties` and `/api/transactions` stay 404 |
+| `ENABLE_BUSINESS_SYNC_API` | `true` in `wrangler.jsonc` | Independent kill switch for the staged cross-browser snapshot/feed/mutation API | Enabled for the 2026-09-02 rollout. Setting it back to `false` does not delete data, but it strands a sync-enabled client on 404s with no `no_active_dataset` code — flip it together with the client flag and redeploy |
+| `VITE_STANDALONE_LOCAL` | `true` in the standalone shape only | The SECOND flag `src/main.jsx` requires. A PROD build with `VITE_USE_LOCAL_AUTH=true` and this one absent, `false` or empty still refuses to boot, so a stray build cannot ship the untrusted auth path by accident. | Setting this on a build that can be reached anonymously = SECURITY DISASTER. Browser-side login and MFA are bypassable by anyone who loads the page; the upstream identity proxy (e.g. Cloudflare Access) is then the ONLY real boundary |
+| `VITE_WEBSOCKET_ENDPOINT` | unset, or a `ws://` / `wss://` URL | Realtime CRDT sync (`src/crdt.jsx`). Only a ws/wss URL enables it; **any** other value (`disabled`, `off`, an `https://` URL, whitespace) resolves to unset and is warned about, so a hosting dashboard that refuses an empty value can still express "off". | Before 2026-08-23 any non-empty value reached `new WebsocketProvider()` and started a backoff loop that retried for as long as the tab stayed open |
+
+Gate: `scripts/probe-standalone-deploy.mjs` (61/0) evaluates the boot condition and the
+endpoint resolution **extracted verbatim from `src/main.jsx` and `src/crdt.jsx`** against a
+table of environments. Reimplementing either rule inside the probe would only prove the
+probe agrees with itself, and would keep passing after the real guard was deleted. Sections
+5 and 6 do the same for the BUILD-time guard: they import `envGuardPlugin.js` and call its
+real `configResolved` hook against a table of environments, then assert the guard is wired
+into `vite.config.js` and that the CI build step supplies both flags.
+
+### Base44 Config
+| File | What It Does |
+|------|-------------|
+| `base44/config.jsonc` | Build commands + production security headers (CSP, HSTS preload, X-Frame DENY, nosniff) |
+| `base44/.app.jsonc` | Links to cloud app ID: `6a7d6856ee1cc714b1803c0e` |
+| `base44/auth/config.jsonc` | Auth methods enabled: password + Google OAuth (MS/FB/Apple/SAML disabled) |
+| `base44/connectors/googledrive.jsonc` | Google Drive OAuth scopes (drive + email) |
+
+---
+
+# 10. TEST SCRIPTS — live gate re-measured 2026-09-01
+
+The current auto-discovered gate is **142 suites** at list
+`b24b8cfa`: the production-auth completion run reported 141 PASS, 0 FAIL,
+and one explicit Not Run (`probe-config-exposure`, because no localhost dev
+server was running). Vitest separately passed 45 files / 341 tests.
+
+Auth-specific evidence:
+
+- `probe-worker-app-auth.mjs`: 16/16 local Worker contract, including owner
+  route capabilities and a non-owner privilege-escalation negative.
+- `probe-worker-auth-remote.mjs`: 8/8 isolated remote Cloudflare runtime.
+- `smoke-production-auth.mjs`: 22/22 real production; cleanup proved one
+  versioned owner, zero legacy owners, and zero residual sessions, challenges,
+  or smoke users.
+- `probe-property-id-type.mjs`: 29/29 numeric/string cascade and isolation.
+
+`probe-worker-auth-remote.mjs` has an environmental failure mode that looks like a
+credential regression and is not one. Before it asserts anything it creates a real
+temporary D1 with `wrangler d1 create`, and Cloudflare intermittently refuses that
+one call with HTTP 401 `Authentication error [code: 10000]`. Observed 2026-09-03:
+the refusal arrived while the OAuth token was valid — `d1 (write)` in scope, expiry
+an hour out, and `GET /d1/database`, `/user`, `/accounts` and `/memberships` all
+returning 200 in the same process 0.2s later. A differential over this machine's 30
+`d1 create` invocations found 28 successes, and on 2026-09-01 the byte-identical
+command failed at 09:23:32 and succeeded at 09:23:59 — 27 seconds later, same token,
+same flags, no repository change. Re-running the suite unchanged returned 8 passed,
+0 failed. DELIVERED F-076: only the `d1 create` call may SKIP — the exact
+`Authentication error [code: 10000]` signature (classified by
+`scripts/_cloudflare-transient.mjs`) prints one `SKIP:` line and exits 0, while
+every other wrangler failure and all eight assertions keep failing loudly.
+`verify-all` therefore reports SKIP for a run that asserted nothing instead of
+FAIL. A FAIL from this suite is now evidence again — retry a SKIP, believe a FAIL.
+
+Measured, not estimated. The heading here previously read "106 Files", which matched
+nothing countable. Re-counted 2026-08-22; the 2026-08-20 set (117 / 95 / 73 / 71 / 34)
+had gone stale as suites were added during the launch remediation, so **re-run the
+one-liners rather than trusting these numbers**:
+
+```
+scripts/ on disk, all files incl. subdirs   132
+  .mjs at the top level of scripts/         110
+  named probe-*.mjs / verify-*.mjs           85
+  auto-discovered as suites by verify:all    83   <- the number that matters
+vitest .test/.spec files elsewhere in repo   36
+```
+
+83, not 85, because `verify-all.mjs` (the runner) and `verify-brain.mjs` (a docs gate) are
+suite-named but excluded by name. Run `npm run verify:all -- --list` for the live list and
+the exclusion reasons; every run also prints a `list <id> (<n> discovered)` fingerprint.
+The fingerprint is `list 0c624d13 (83 discovered)` as of 2026-08-22. It changes
+legitimately whenever a suite is added, so compare it **across shards of a single run** —
+never against a number copied out of a document.
+
+### Test Infrastructure
+| File | What It Does |
+|------|-------------|
+| `scripts/_loader-boot.mjs` | Node bootstrap: @/ alias resolution, browser global shims (document, location), Web Worker shim |
+| `scripts/_harness-auth.mjs` | Creates in-memory Owner account for fail-closed auth in tests |
+| `scripts/resolve-alias.mjs` | Custom ESM loader: @/ -> src/ |
+| `scripts/resolve-base44.mjs` | Custom ESM loader: redirects @base44/sdk to local stubs |
+| `scripts/stubs/base44-runtime.mjs` | In-memory Base44 host mock (secret store, entity DB) |
+| `scripts/stubs/base44-sdk.mjs` | In-memory SDK mock with -field sorting and monotonic sequences |
+| `scripts/acceptance-harness.mjs` | 11 stateful sections that must run in order. **It does NOT run all probe tests** — that is `npm run verify:all`. It is not even auto-discovered (its name matches neither `probe-*` nor `verify-*`), it needs `vite`, and section 3.5 deletes ~7918 rows through `fake-indexeddb` so it cannot finish in a Linux sandbox. Opt-in flags: `HARNESS_SKIP=3,4`, `HARNESS_TIMING=1` |
+| `scripts/probe-db-mock-rls.mjs` | **The only automated guard on `base44/**`.** Fails on any `__B44_DB__` shim or `db.*` call site in a serverless entry, deep-equals every property-scoped RLS rule against the canonical rule, then EXECUTES all 20 shipped rules against a 9-case access matrix. Mutation-self-tests every run: it rebuilds both historical RLS corruptions and fails if the matrix does not catch them. |
+| `scripts/probe-audit-chain.mjs` | Imports the REAL serverless entry files (via `resolve-base44.mjs`) and asserts all 7 copies of the canonical audit payload agree with the verifier |
+| `scripts/probe-deploy-config.mjs` | Parses (not pattern-matches) `manifest.json`, `vercel.json`, CSP headers |
+
+### How To Run Tests
+```powershell
+# EVERYTHING. Start here -- auto-discovers all 111 suites, distinguishes PASS / FAIL /
+# BROKEN (could not start) / TIMEOUT (could not finish) / BAD-EXIT / SKIP.
+npm run verify:all
+npm run verify:all -- --list            # the live list + why anything is excluded
+npm run verify:all -- --filter money    # one slice (plain substring match)
+npm run verify:all -- --shard 3/9       # the 3rd of 9 slices, for a capped wall clock
+
+# One suite
+node --import ./scripts/_loader-boot.mjs scripts/probe-money-kept-fix.mjs
+
+# Probes that run standalone (no loader needed -- they stub the host themselves)
+node scripts/probe-db-mock-rls.mjs
+node scripts/probe-audit-chain.mjs
+node scripts/probe-deploy-config.mjs
+
+# Static gates
+npm run lint            # eslint . --quiet     0 errors expected
+npm run lint:fix
+npm run typecheck       # tsc -p ./jsconfig.json with checkJs -- JSDoc is load-bearing
+npm run brain:verify    # documentation gate (git hook); NOT a behaviour suite
+
+# Vitest unit tests (34 .test/.spec files)
+npm test                # vitest run
+npm run test:watch
+```
+
+> [!CAUTION]
+> **`npm test` and `scripts/acceptance-harness.mjs` do not run in a Linux sandbox** when
+> `node_modules` was installed on Windows. Measured 2026-08-20:
+> `Error: Cannot find module @rollup/rollup-linux-x64-gnu`. Same cause as the
+> `verify-harness.mjs` SKIP. That is an environment limit, **not** a passing result — run
+> them on Windows or in CI, and record them as *Not Run* anywhere else.
+>
+> **Do not lower `--timeout` to make a run fit a command-time cap.** It kills slow suites
+> and labels them TIMEOUT, which fabricates failures. Shard the list instead, and confirm
+> every shard printed the same `list <id>` before adding the shards up. Both traps are
+> written up in BRAIN_TROUBLESHOOTING.md 22.3 and 22.5.
+
+> [!IMPORTANT]
+> `verify-transactions.mjs` and `verify-coexistence.mjs` MUST be run with
+> `node --import ./scripts/_loader-boot.mjs`. Bare `node scripts/verify-*.mjs` dies on the
+> `@/lib` alias or attempts a real HTTP call, which looks like a code failure but is not.
+
+---
+
+## Worker D1 write contracts (2026-09-02)
+
+- `worker/schema.sql` must remain column/index/constraint compatible with `migrations-production/0001_auth_schema.sql` for every production-auth table. `scripts/verify-schema-parity.mjs` compares the real DDLs and keeps production authentication-only.
+- Generic entity creation suppresses only deterministic same-primary-key replays with `ON CONFLICT(id) DO NOTHING`. It does not use blanket `INSERT OR IGNORE`, which previously hid required-field, foreign-key, and business-key failures.
+- D1 write failures are classified by constraint kind: uniqueness is 409; missing/invalid/reference data is 422; non-constraint failures remain generic 500 without SQL details.
+- Roster business keys are preflighted for an actionable conflict response, while the database uniqueness constraint remains the authority for races.
+- Bulk writes remain one D1 batch so a rejected row cannot leave neighboring rows committed.
+- The Worker user API stores real versioned credentials in the same atomic batch as the new user and grants. Password change/reset operations revoke sessions and MFA challenges in the same batch as the credential replacement.
+
+Primary gates: `scripts/probe-worker-entities-conflict.mjs`, `scripts/probe-worker-entities-roster-create.mjs`, `scripts/probe-worker-credential-lifecycle.mjs`, and `scripts/verify-schema-parity.mjs`.
+
+---
+
+## Authoritative Cross-Browser Sync Property Mapping (2026-09-06)
+
+- **Numeric vs. String Property ID Dual-Resolution**: Dexie stores `Property` records with auto-increment numbers (`n:1`), while parser and HTML select elements produce string IDs (`s:1:1`). `worker/business-sync.js` resolves this with `alternateKeyMap` during migration activation, ensuring child records reference their valid property without `422 orphaned property reference` errors and ensuring `UPDATE business_record SET server_property_id=?` covers both keys.
+- **Session Property Access Expansion**: `worker/index.js` `/api/session` decodes `business_property_map` entries for the active generation to ensure scoped non-owner roles (e.g. GMs) receive both server property IDs and their corresponding local numeric/string keys in `property_access`.
+- **User Administration Property Resolution**: `worker/users.js` `assertProperties` resolves incoming property IDs against active migration mappings when local numeric IDs are supplied by UI selectors.
+- **Bulk Import Property Identity Resolution**: Every bulk-import route that accepts a caller property id (`resolveServerPropertyId` in `worker/bulk-import.js`) may canonicalize it through the authenticated account's active `business_property_map` generation (`business_dataset_pointer` -> typed identity contract, so legacy local alias ids resolve to the canonical server property id). The resolved canonical id is still required to be in caller scope: missing, ambiguous, or out-of-scope identities fail closed with no owner bypass. Guarded by `scripts/probe-bulk-import-property-identity.mjs`.
+- **Client Manifest & Invalidation**: `src/api/businessSync.js` computes revenue cents across both `total_revenue` and `room_revenue` fields and emits `publish('dataset', 'hydrate')` on snapshot load; `src/pages/Dashboard.jsx` invalidates `"daily-aggregates"` and `"properties"` to eliminate cold-browser stale caches.
+- **Late Hydration Readers Join the Pull**: `ensureFresh()` awaits the active pull or hydration promise when a read arrives after snapshot hydration has started. A cold Browser B therefore cannot resolve a dashboard query against the pre-hydration empty cache.
+- **Sync Admission Is Bounded and Server-Owned**: Direct mutation rows reject `account_id` and `server_property_id`, migration start accepts schema version 1 only, and each account may hold at most three pending cloned transactions. The pending limit is enforced inside the D1 batch as well as by a fast pre-check so concurrent starts cannot exceed it.
+- **Transaction Cleanup Authorization**: A pending transaction may be aborted only by its creator or an account owner/admin. Non-admin creators must still hold every staged property grant at abort time; account-global targets remain all-property only.
+- **Rollback Code Evacuation**: Active-generation rollback first moves every current property ID or code that conflicts with the previous roster to a unique temporary code in the same D1 batch, then restores the prior roster. This breaks swaps and reuse cycles without deleting properties or cascading away grants.
+- **User Role Hierarchy**: A GM with delegated `manage_users` can manage GM/manager/front-desk accounts but cannot create, promote, modify, reset, or delete an admin. Owner-only restrictions remain in force for owner accounts.
+
+Primary gates: `scripts/probe-cross-browser-sync-e2e.mjs`, `scripts/probe-gm-property-access.mjs`, `scripts/probe-adversarial-browser-b-kpis.mjs`, and `scripts/probe-worker-business-sync.mjs`.
+
+---
+
+## Cloudflare D1 Write-Amplification Remediation (Option D Architecture) (2026-09-06)
+
+- **Elimination of O(N) Generation Cloning**: `startTransaction` in `worker/business-sync.js` no longer clones the active generation (previously copying 38,684 rows into `business_record`). Routine transactions now stage deltas in `business_record_staging` without touching the active generation until commit.
+- **Set-Based Atomic In-Place Commit**: On `commitTransaction`, staged deltas are applied directly to the active dataset in `business_record`, generating sequential change logs in `business_change` (`seq = currentRevision + 1 + index`) and advancing `business_sync_state.revision += stagedRows.length`.
+- **Inverse Pre/Post-Image Rollback Journaling with CAS Conflict Protection**:
+  - `business_rollback_journal` captures the exact pre-image (`previous_row_json`, `previous_row_hash`) and applied post-image hash (`applied_row_hash`).
+  - `POST /api/business-sync/transaction/rollback` restores prior states in $O(M)$ time. If any live record was altered by a subsequent transaction, CAS detection fails closed with HTTP 409 `ROLLBACK_CONFLICT`.
+- **Migration Rollback Barrier**: When transactions commit against an active generation, `business_dataset.post_migration_mutated` is set to `1`. Subsequent calls to `rollbackMigration` are rejected with HTTP 409 `MIGRATION_ROLLBACK_BLOCKED` to prevent destroying post-migration business changes.
+- **Migration Upfront Property Resolution**: `uploadChunk` resolves and stamps authoritative `server_property_id` on initial insert. `activateMigration` performs zero rewrites on `business_record` (reducing activation writes by 38,683 rows).
+- **Auth Session Sliding Hysteresis & Fail-Silent Recovery**:
+  - `authenticateAppSession` in `worker/app-auth.js` enforces a 15-minute sliding hysteresis window before issuing `UPDATE app_session` writes.
+  - Heartbeat touches on read paths are non-blocking and fail-silent: transient D1 write quota limits do not block authenticated reads.
+- **Client Realtime Tab Leader Election & Backoff**:
+  - `src/lib/realtime.js` establishes a single leader tab across open browser tabs via `BroadcastChannel` (`rri_realtime_leader`). Only the elected leader executes the active polling timer.
+  - When the leader polls, it broadcasts `POLL_TICK` to all peer tabs so they refresh local queries simultaneously without making redundant server requests.
+  - Tabs automatically pause polling when minimized or hidden (`document.hidden`).
+  - Exponential backoff doubles polling intervals up to 60s upon network or server errors, resetting to 10s on success.
+- **Empirical Write Accounting (Proven by `scripts/probe-d1-write-budget.mjs`)**:
+  - Total Lifecycle Writes for a transaction of $M$ operations chunked at 13 per chunk:
+    $rows\_written = 9M + 4 \cdot \lceil M / 13 \rceil + 17$.
+  - Measured points (index-inclusive, metered `rows_written`): $M=1 \to 30$, $M=3 \to 48$, $M=100 \to 949$ (the latter is 8 chunks, `900 + 32 + 17`).
+  - Deterministic projections asserted by the probe: $M=1000 \to 9325$, $M=3000 \to 27941$, $M=7918 \to 73719$, $M=10000 \to 93097$, $M=17000 \to 158249$.
+  - The $100\,000$ D1 row budget is crossed between $M=7918$ (73,719 rows, under budget in isolation) and $M=17000$ (158,249 rows, EXCEEDS flag).
+  - Session Read: 0 writes within 15-minute window; 1 write after window expiry.
+
+Primary gates: `scripts/probe-d1-write-budget.mjs` (11 assertions: write bounds, session hysteresis, and five exact projection values with 100,000 budget checks), `scripts/probe-realtime-leader.mjs`, `scripts/probe-worker-business-sync.mjs`, `scripts/probe-business-sync-global-records.mjs`, and `scripts/verify-schema-parity.mjs`.
+
+---
+
+## D1 Account Quota Outage Protection & Write Budget Architecture (2026-09-12)
+
+- **Root Cause & Outage Chain**: Cloudflare Free plans enforce an account-wide limit of 100,000 D1 rows written per day, resetting at 00:00 UTC. Prior to this fix, bulk hotel imports (e.g. 7,918 to 17,000 operations) consumed between 73,719 and 158,249 writes, exhausting the account quota. Once exhausted, D1 returned quota errors for all reads and writes, disabling session creation and validation.
+- **Fail-Closed Auth & Truthful 503**:
+  - Auth remains strictly fail-closed: no unverified sessions or unpersisted cookies are issued.
+  - `isD1QuotaError` in `worker/db.js` normalizes Cloudflare daily read and write quota exceptions.
+  - `login` in `worker/app-auth.js` returns HTTP 503 `D1_SERVICE_QUOTA_EXHAUSTED` with 0 cookie and 0 lockout increment (avoiding false "Invalid password" and false account lockout).
+  - Session verification in `authenticateAppSession` catches quota errors and returns `{ ok: false, serviceUnavailable: true }`, which `worker/index.js` routes as 503 instead of treating as invalid credentials.
+- **Canonical Write Budget & Admission Control**:
+  - `worker/budget.js` and `src/lib/d1WriteBudget.js` share the bit-exact calibrated formula:
+- **Atomic Database-Level Budget Reservation**:
+  - `startTransaction` enforces the daily write budget inside the `env.DB.batch` transaction using an atomic SQL CHECK constraint on `business_mutation_guard` (`${txId}:budget`).
+  - Simultaneous requests from Browser A and Browser B cannot race: SQLite serializes the batch, the first reservation commits, and any concurrent reservation oversubscribing the 80,000 budget fails `CHECK (ok = 1)`, immediately rolling back the entire batch with 0 staging or dataset rows written.
+- **Irreversible Consumed-Write Accounting & Cross-Midnight Cleanup Attribution**:
+  - Staging writes ($3O + 2C + 2$) and cleanup writes ($3O + C + 1$) remain charged against the daily budget when a transaction is aborted or expires ($6O + 3C + 3$ total).
+  - For transactions created before 00:00 UTC and aborted/expired after 00:00 UTC, the physical cleanup writes ($3O + C + 1 = 9,235$ writes for 3,001 ops) are charged against today's budget because the DELETE statements execute today.
+  - `abortTransaction`, `expirePendingTransactions`, and commit conflict cleanup record `rolled_back_at = now` on `business_staging_transaction` to accurately track cross-day cleanup execution.
+- **Orphan Transaction Recovery**:
+  - Added `GET /api/business-sync/transaction/pending` (owner/admin scoped) to discover pending or stranded transactions without requiring the originating browser outbox.
+  - Owners can explicitly invoke `POST /api/business-sync/transaction/abort` to safely clean up all staging records, staging targets, and dataset rows while leaving active generations intact.
+- **Account-Wide Test Safety & Deterministic Gates**:
+  - Default release gate (`verify:all`) is 100% deterministic, offline, and runs without consuming Cloudflare account quota.
+  - `probe-worker-auth-remote.mjs` is guarded by `ALLOW_REMOTE_D1_MUTATION_TESTS=true` and explicit test DB allowlists, preventing test runs from draining production account quota.
+
+Primary gates: `scripts/probe-d1-quota-auth-failure.mjs`, `scripts/probe-d1-quota-admission.mjs`, `scripts/probe-atomic-budget-concurrency.mjs`, `scripts/probe-orphan-transaction-recovery.mjs`, `scripts/probe-import-write-amplification-breakdown.mjs`, and `scripts/probe-suite-integrity.mjs`.
+
+## Bulk Import Architecture: Immutable Data Plane & Compact D1 Manifests
+
+- **Architectural Shift**: Bulk hotel import files (occupancy, source, gross revenue, payments, clerk, adjustments & refunds, hotel statistics, transactions, timecard) are routed through an immutable content-addressed data plane backed by Cloudflare R2 (`rri-bulk/<account_id>/<server_property_id>/v1/<hash>.ndjson.gz`), completely bypassing the per-row 13-chunk D1 staging path.
+- **D1 Quota Preservation**:
+  - D1 write consumption per file scales O(files) and is row-invariant (O(1) w.r.t row counts), bypassing row-by-row staging (which took 73,719 to 158,249 writes for 7,918 to 17,000 transactions).
+  - Local index model estimates ~20 metered rows_written/file; full remote import writes remain unmeasured on edge D1 pending canary tests (real measurement on canary D1 observed 11 physical writes for a 3-statement activation fixture, not a full import).
+  - Duplicate preflight checks consume 0 D1 writes (indexed SELECT query on `raw_file_hash` / `normalized_hash`).
+  - Cloudflare Free Tier (100k daily cap) supports > 4,000 bulk files/day under the index model instead of 1 file.
+- **Worker CPU & Timeout Protection**:
+  - Browser compresses NDJSON bundles client-side using native `CompressionStream('gzip')`.
+  - Worker streams compressed body directly into R2 storage (`env.BULK_DATA.put`) without full-payload RAM buffering.
+  - Local testing observed approximately < 2 ms CPU time for the streaming path and < 1.2 seconds elapsed timing in the local test harness.
+  - Real Cloudflare edge Worker CPU and memory remain UNMEASURED / UNPROVEN pending successful remote canary execution after error 10136 is resolved; compliance with the Cloudflare edge 10ms CPU limit has not yet been demonstrated on edge runtime.
+- **Deterministic ID Parity & Cold Hydration**:
+  - Client generates deterministic 53-bit integer IDs from hash seeds, guaranteeing exact bit-for-bit row ID matching across all browsers (Browser A, Browser B, headless).
+  - Browser B receives an `ImportBundle` change event via the business sync feed, downloads the bundle from `/api/bulk-import/bundle/:id`, decompresses via `DecompressionStream('gzip')`, and materializes directly into IndexedDB (`localDb`).
+  - Pre-computed daily aggregates are refreshed automatically without querying D1.
+- **Zero Stranded Rows & Rollback**:
+  - `POST /api/bulk-import/delete` tombstones the manifest and emits an `ImportBundle` deletion event.
+  - Client evicts all materialized rows and cleans up `UploadedReport` history entries.
+- **Primary Probes & Gates**:
+  - `scripts/probe-bulk-import-performance.mjs`
+  - `scripts/probe-bulk-import-cost-model.mjs`
+  - `scripts/probe-bulk-import-e2e.mjs`
+  - `scripts/probe-bulk-import-mutations.mjs`
+
+### Import UI and request hardening — 2026-09-23
+
+- All nine mutating `/api/bulk-import/*` client requests send `X-Requested-With: XMLHttpRequest`; the Worker same-origin mutation check remains enabled.
+- The Import workflow no longer applies its client import-rate limiter. Cloud bulk imports treat the projected Free-plan D1 write budget as advisory; destructive-action throttling and server/provider quota errors remain enforced.
+- Existing file and memory ceilings remain in place: 50 MiB client parse/raw upload, 25 MiB compressed normalized bundle, 16 MiB decoded Worker bundle, and 64 MiB browser compression/decompression output.
+- These ceilings cannot be raised safely by changing constants alone. The client builds full normalized representations; the Worker buffers compressed bytes, decodes to text, splits/parses all rows, and sorts canonical rows before hashing. Streaming support must preserve those validation and normalized-hash semantics.
+- `scripts/probe-bulk-import-mutation-headers.mjs`, `src/lib/bulkImportPipeline.test.js`, and `src/pages/ImportBatch18Regression.test.jsx` cover the request headers, 18-file queue, duplicate behavior, retry/Import All, and role expectations.
+
+## Permanent One-Shot Raw Archive & Immutable Historical Data Plane
+
+- **Core Architecture & Philosophy**:
+  - Historical HotelKey reports are immutable source artifacts. Once a month or period closes, historical source files are never modified.
+  - Implements a two-tier storage topology:
+    1. `rri-raw/<account_id>/<server_property_id>/<raw_file_hash>`: Canonical, exact, untouched, byte-for-byte binary source archive (CSV, XLSX, XLS). Identical file bytes with different filenames or report periods resolve to ONE canonical object.
+    2. `rri-bulk/<account_id>/<server_property_id>/v1/<normalized_hash>.ndjson.gz`: Normalized, versioned, gzip NDJSON analytics bundle.
+- **Two-Stage Decoupled Ingestion Pipeline**:
+  - **Stage 1 (One-Shot Archival)**: When the user selects 50, 100, or more HotelKey files, the browser hashes each file and streams the untouched original directly to Cloudflare R2 (`PUT /api/bulk-import/raw-upload`), creating a `raw_archived` record in D1 (`POST /api/bulk-import/raw-archive`).
+  - **Stage 2 (Progressive Processing)**: Files are processed progressively (parsed, normalized, activated).
+  - **PC Loss / Network Interruption Resumption**: If the browser tab closes, crashes, or the computer loses power during processing, **the user never has to re-select or re-upload files**. A fresh browser session (Browser B) discovers all pending archives (`GET /api/bulk-import/pending`), fetches the raw payload directly from R2 (`GET /api/bulk-import/raw/:id`), and resumes processing with **0 local files re-uploaded**.
+- **Worker Memory Protection & True R2 Streaming**:
+  - Enforces `MAX_RAW_FILE_SIZE_BYTES = 50 * 1024 * 1024` (50 MB) and `MAX_BUNDLE_SIZE_BYTES = 25 * 1024 * 1024` (25 MB compressed) to prevent exceeding the Worker 128 MB RAM ceiling.
+  - Upfront `Content-Length` preflight validation rejects 0-byte bundles (`400 IMPORT_EMPTY_PAYLOAD`) and oversized bundles (`413 PAYLOAD_TOO_LARGE`) before body consumption.
+  - Unknown `Content-Length` bounded streaming: `createBoundedStream` monitors bytes chunk-by-chunk with zero full-body RAM buffering, aborting if bytes exceed 25 MB (413) or if stream terminates empty (400).
+  - Production R2 path streams `request.body` directly to `bulkStore.put` and `rawStore.put` with zero `request.arrayBuffer()` buffering.
+  - Validates SHA-256 natively in R2 via `x-payload-sha256` and `sha256` options.
+- **Concurrent Duplicate & Race Protection**:
+  - **Raw Upload Concurrency**: Browser A and B uploading identical raw bytes simultaneously resolve to 1 canonical R2 object key and 1 logical manifest via atomic `INSERT ... SELECT ... WHERE NOT EXISTS`.
+  - **Normalized Activation Concurrency**: Concurrent activations of the same normalized bundle resolve idempotently to 1 active bundle without duplicate analytics feed events or duplicate D1 rows.
+- **Write-Once Immutability & Tamper Resistance**:
+  - Raw objects are content-addressed by SHA-256 hash.
+  - Re-uploading the exact same bytes returns `200 OK` (idempotent no-op).
+  - Attempting to overwrite an existing archive key with different content returns `409 Conflict`.
+  - Checksum verification: declared hash must match byte digest exactly; mismatches return `400 Bad Request`.
+- **Historical Report Correction & Supersede Lineage**:
+  - If an amended or corrected report arrives for a past month, the original raw file is **never overwritten**.
+  - Both original raw files (v1 and v2) remain permanently in R2.
+  - D1 records authoritative bidirectional lineage pointers (`supersedes_bundle_id` and `superseded_by_bundle_id`).
+  - Client hydration automatically renders active corrected figures while evicting obsolete rows from Dexie.
+- **Strict Delete Semantics & R2 Bucket Lock Governance**:
+  - "Remove from Analytics" deactivates the normalized analytics bundle in D1 and evicts local Dexie rows, but **NEVER touches the raw archive in R2**.
+  - Cloudflare R2 Bucket Locks: Supports prefix retention rules (`rri-raw/*`) for fixed durations or indefinitely. Unlike AWS Compliance WORM, Cloudflare indefinite bucket lock rules can later be removed by an authorized account operator, providing safe governance without operational risk.
+  - `POST /api/bulk-import/raw-destroy` executes R2 deletion **FIRST**. If R2 rejects deletion due to an active Bucket Lock, D1 status remains `raw_archived` and the endpoint returns HTTP 423 `RAW_ARCHIVE_LOCKED`. D1 is updated to `destroyed` only after R2 confirms physical deletion.
+- **Bit-for-Bit SHA-256 Parity & Download Original**:
+  - Every imported bundle in the UI features a "Download Original" button.
+  - Downloads the original binary stream from R2 with identical byte length and SHA-256 checksum across CSV, XLSX, and XLS formats.
+- **D1 `rows_written` Metering & Accounting**:
+  - **Local Index Model**: 1 table row + 5 index entries = **6 metered writes** in Stage 1; manifest update (9) + sync state (1) + change event (4) = **14 metered writes** in Stage 2. Total: **20 metered rows_written/file** (estimated by index model).
+  - **Real Cloudflare D1 Measurement**: Staging D1 database (`boston-project-staging-data`) does not have migration 0005 applied; measurement against real remote D1 requires owner authorization for disposable non-production D1 creation.
+  - **Daily Free Tier Capacity (80k budget)**: **4,000 entire files per day**.
+  - **Scaling**: Strictly $O(\text{files})$, completely row-invariant ($O(1)$ w.r.t row count).
+- **Primary Probes & Gates**:
+  - `scripts/probe-bulk-import-archive-resume.mjs`
+  - `scripts/probe-bulk-import-hash-parity.mjs`
+  - `scripts/probe-bulk-import-immutable-source.mjs`
+  - `scripts/probe-bulk-import-supersede-lineage.mjs`
+  - `scripts/probe-bulk-import-archive-mutations.mjs`
+  - `scripts/probe-bulk-import-indexed-d1-writes.mjs`
+  - `scripts/probe-normalized-bundle-streaming.mjs`
+  - `scripts/probe-raw-concurrent-duplicate.mjs`
+  - `scripts/probe-normalized-concurrent-duplicate.mjs`
+  - `scripts/probe-raw-canonical-security.mjs`
+- **Server Canonical Key Enforcement & Dual-Boundary Verification**:
+  - `uploadRawArchive` strictly computes the canonical key `rri-raw/<account_id>/<server_property_id>/<raw_hash>` server-side; client attempts to supply `x-raw-object-key` or `raw_object_key` are disregarded.
+  - `recordRawArchive` NEVER trusts `body.raw_object_key`. It computes the canonical key server-side, executes an R2 `head()` check verifying object existence, `account_id`, `server_property_id`, and `raw_hash` metadata ownership before creating the D1 manifest row.
+  - `downloadRawArchive` enforces a strict scope boundary check (`raw_object_key.startsWith('rri-raw/<account_id>/<property_id>/')`) preventing cross-tenant object confusion.
+  - Path traversal and cross-account/cross-property injection attempts fail closed with 403 `SCOPE_DENIED`, 403 `RAW_OBJECT_SCOPE_MISMATCH`, or 400 `IMPORT_INVALID_HASH`.
+
+
+
+
+
+
+
+## Bulk import integrity — 2026-09-12 implementation
+
+The frozen review baseline was `fe532fde3af650527437adf6f8876506c5bdb26d`.
+`worker/bulk-import.js` now computes and verifies exact account/property/hash object
+keys, requires both R2 bindings, and has no production memory store. Test bindings
+live only in `scripts/_r2-testkit.mjs` and are injected explicitly.
+
+`worker/bulk-contract.js` defines the entity allowlist and version-2 business-content
+hash. Generated IDs, import provenance and timestamps are excluded from identity.
+The server validates gzip, content hash, entity, property and counts before upload;
+activation derives report coverage from those verified bytes. Raw input is capped
+at 50 MiB, compressed bundles at 25 MiB, and decoded bundles at 16 MiB. These limits
+are correctness guards, not proof of remote CPU/memory suitability.
+
+Raw deletion uses `archived -> destroying -> destroyed`, independent of analytics
+`status`. Migration `0006_bulk_import_integrity.sql` expands the CHECK from 0005
+without changing 0005 or dropping any manifest columns/data. Intent is durable
+before deletion; retry completes after an ambiguous deletion or failed D1 completion.
+Only recognized retention errors are labeled locked. Ordinary storage failures stay
+pending. A source shared by multiple manifests receives the same raw lifecycle state.
+No background reconciliation scheduler has been deployed: the owner retries the
+same confirmed request. Analytics deletion tombstones manifests and retains immutable
+normalized bytes; a separate reference-aware collector is required for physical GC.
+
+Activation and replacement commit manifest(s), revision and feed together. Conflicting
+revision allocations retry the full transaction. Replacement requires an active,
+same-property/report predecessor with its expected revision. Multiple overlapping
+reports fail closed for explicit reconciliation. The UI's Force Import selects a
+single overlapping predecessor and sends its revision. Parser corrections can reuse
+one original while producing a new analytics version. Identical business content
+resolves to the existing active bundle.
+
+Resume passes archived bytes, original hash and manifest identity through CSV/XLS/XLSX
+parsing and activation. Excel uses the existing local xlsx dependency, requires one
+sheet, and never silently skips additional sheets. Hydration verifies complete pages
+before atomically committing rows, evictions and a property-specific (revision,id)
+cursor. The ID tie-breaker preserves same-revision replacements across page boundaries.
+HTTP sends opaque `application/gzip` bytes without Content-Encoding, so decoding occurs
+exactly once. Rows are assigned manifest-owned local identities.
+
+Bulk report rows replace overlapping legacy cache rows for covered entity/dates.
+Legacy cache rebuilds reapply the complete bulk authority. Reset tombstones applicable
+bulk manifests as well as deleting legacy business records, including bulk-only
+accounts; original raw files remain. Existing overlapping active R2 reports from older
+code are not automatically adjudicated: reconcile them before enabling production.
+
+Evidence: `scripts/probe-bulk-import-integrity.mjs` calls the real pipeline and
+hydration service against sequential production migrations, explicit R2 doubles and
+real Dexie. It covers isolation, missing bindings, identity, replacement, same-source
+parser correction, CSV/XLS/XLSX resume, hydration failures, deletion recovery,
+concurrency, legacy/reset and real local HTTP gzip behavior. Existing bulk probes
+retain their assertions; cost probes now count writes separately from SELECTs and
+actually generate their claimed 100k rows.
+
+Solo implementation was explicitly requested: no Gemini, OpenCode or subagent calls.
+Production was not changed. Remote Cloudflare tests await an isolated Worker, D1 and
+R2 target; local tests do not establish bucket-lock error shapes, CPU limits, live
+migration/rollback or deployment readiness. Apply/test migration in staging before
+code rollout. Do not roll back to the reviewed destructive handler; keep bulk routes
+unavailable while restoring a verified compatible release. A short independent review
+of the resulting commit is still required before production.
+
+## Bulk import final review corrections — 2026-09-12
+
+Activation now repeats the overlap predicate inside the D1 batch before changing
+any manifest. A competing overlapping activation aborts the entire transaction,
+including its revision, event and guard rows. Guard conflicts retry fresh validation,
+so simultaneous identical content remains an idempotent success. The regression pauses A after its
+preflight overlap query, commits B, then releases A with a fresh revision read.
+
+Raw deletion recognizes R2 code 10069 / ObjectLockedByBucketPolicy and the R2
+operation error marker. Generic failures remain 503 with durable destroying intent;
+a retry can complete even after deletion succeeded but its response was lost.
+The explicit test R2 binding now reports the documented numeric lock code.
+
+Hydration uses a shared commit token in BusinessSyncState, checked and changed in
+the same transaction as rows, history and cursor. An older all/property or other-tab
+page cannot commit after another hydration without refetching current authority.
+Five consecutive conflicts stop with a retry message. Network work stays outside
+Dexie transactions. Force callers recheck the flight after waiting.
+
+The integrity probe includes populated 0005-to-0006 preservation of all old columns,
+active/superseded/raw-archived states, indexes, constraints and local transaction
+rollback; no migration SQL changed. The stale hydration probe first reproduced
+row resurrection, then proved rows/history stay removed and cursors stay current.
+Memory at maximum payload sizes, real cross-browser runtime, remote D1 migration
+and rollback, R2 lock error shapes and metered writes remain canary requirements.
+This continuation was completed directly by Codex under the owner's solo instruction.
+
+## Bulk import R2 lock recognition & test hardening — 2026-09-12
+
+Raw archive deletion (`destroyRawArchive` in `worker/bulk-import.js`) recognizes
+Cloudflare R2's native bucket lock policy error string terminating in numeric code
+`(10069)` (e.g. `delete: Object is protected by bucket lock policy. (10069)`), returning
+HTTP 423 `RAW_ARCHIVE_LOCKED`. Generic R2 operational failures (such as `(10043)`) stay
+503 `RAW_DESTRUCTION_PENDING`.
+Regression probes in `scripts/probe-bulk-import-integrity.mjs` explicitly verify
+`caughtError.code === 'IMPORT_REPLACEMENT_REQUIRED'` on concurrent overlapping commits
+and track `olderPromise` execution to completion without swallowing rejections.
+
+## Pre-production engineering, release runbooks & audit kit — 2026-09-13
+
+Pre-production operational readiness established before remote canary resumption:
+
+- **Read-Only D1 Audit Kit**:
+  - `scripts/audit-production-d1-readonly.sql` provides 17 pure read-only SQL queries covering migration tracking, table inventory, manifest status distributions, active dataset pointer, legacy row counts, date coverage, account/property scoping, sync revisions, overlap candidates, orphan checks, supersede lineage integrity, raw archive lifecycle states, index presence, and foreign key checks.
+  - `scripts/audit-production-d1-readonly.mjs` statically asserts that 100% of statements are non-mutating (`SELECT` / `PRAGMA foreign_key_check`) with zero mutating DDL/DML keywords permitted.
+- **Rollout & Rollback Runbooks**:
+  - `docs/RUNBOOK_PRODUCTION_ROLLOUT.md` establishes 18 sequential gates (Gate 0 platform entitlement through Gate 17 sign-off) with explicit stop conditions and no unverified shortcuts.
+  - `docs/RUNBOOK_ROLLBACK_INCIDENT.md` specifies non-destructive first-line responses, classification levels, and emergency code/traffic reversion playbooks.
+- **Documentation Truth on D1 Write Costs & Worker Performance**:
+  - `11 physical D1 rows_written`: REAL CLOUDFLARE MEASURED on canary D1 `7e746318-2280-4907-931d-9c257b62ee78` for a 3-statement activation SQL fixture (`rows_written [6, 1, 4]`).
+  - `3 SQL write statements`: LOCAL SQLITE MEASURED in test harness.
+  - `20 metered rows_written/file`: ESTIMATED / MODELED by local index model (1+5 Stage 1, 9+1+4 Stage 2).
+  - Full HotelKey report import on production Cloudflare D1: UNMEASURED until Cloudflare Worker R2 binding error 10136 is resolved and remote canary end-to-end import executes.
+  - `Streaming CPU < 2 ms & elapsed < 1.2s`: LOCAL MEASURED in test harness without full-payload RAM buffering.
+  - Real Cloudflare edge Worker CPU and memory: UNMEASURED / UNPROVEN until remote canary execution after Cloudflare error 10136 resolution.
+
+## Canary automation harness & test tooling — 2026-09-13
+
+A dedicated local canary test harness and CLI orchestrator have been established to prepare for remote canary execution upon resolution of Cloudflare error 10136:
+
+- **CLI Orchestrator (`scripts/canary-bulk-import.mjs`)**:
+  - Provides flags: `--dry-run`, `--preflight`, `--smoke`, `--import`, `--concurrency`, `--hydration`, `--lock`, `--large`, `--cleanup`, `--all`, `--json`, and `--output`.
+  - Enforces strict production rejection of `boston-project.divyesh-boston.workers.dev`, service `boston-project`, D1 name `boston-project-production-auth`, and D1 ID `e9008126-d4b4-4588-841c-128eadd94c8d`.
+  - Enforces transport safety: `validateTargetUrl()` is uniformly wired into `assertNotProductionTarget()`, `assertSafeCanaryEnvironment()`, and `CanaryClient` (constructor and redirect loop); requires HTTPS (permits HTTP only for localhost), rejects invalid schemes (`ftp:`, `file:`), rejects embedded userinfo (`@`), and follows manual redirects up to depth 5 with cross-origin `Authorization`/`Cookie` credential stripping.
+  - Requires explicit `CANARY_CONFIRM_ISOLATED=YES` before execution.
+  - Dry-run mode guarantees zero network dispatches (`requestsDispatched === 0`).
+  - Stage 4 Concurrency tests three real races: identical parallel upload idempotency, conflicting overlap rejection (HTTP 409 `BUNDLE_OVERLAP` + supersedes recovery), and distinct non-overlapping monotonic revisions.
+  - Stage 5 Hydration tests independent browser (Browser B) download, gzip decompression, independent client-side canonical normalized hash recomputation (`computeIndependentNormalizedHash`), strict enforcement of required `x-normalized-hash` response header, bit-exact content hash verification against `manifest.normalized_hash`, row counts, deterministic row ID proof via independent algorithm (`computeIndependentDeterministicRowId`) against 5 fixed golden vectors and hydrated rows, rejection of valid-looking mutated IDs, and cursor freshness invalidation.
+  - Stage 6 Bucket Lock requires explicit `--allow-canary-bucket-lock` opt-in to assert HTTP 423 `RAW_ARCHIVE_LOCKED`; otherwise reports skipped and qualifies verdict as `QUALIFIED_PASS (BUCKET_LOCK_SKIPPED)`.
+  - Secret redaction utility strips Bearer tokens, Cookie headers, and auth keys from all logs and reports.
+  - Telemetry classifications strictly separate `LOCAL_CLIENT_MEASURED` (e.g. dispatched request counts) from `UNMEASURED` edge D1 writes.
+  - Stage 8 Cleanup executes within a `finally`-equivalent block across partial uploads or stage failures, ensuring failed runs never leak unmapped R2 keys and return explicit `FAIL` verdicts with complete orphan inventories.
+- **Deterministic Fixture Generator (`scripts/canary/fixture-generator.mjs`)**:
+  - Seeded Mulberry32 generator covering all 9 HotelKey report families (transactions, adjustments_refunds, source, occupancy, gross_revenue, payments, clerk, hotel_statistics, timecard).
+  - Supports ugly CSV edge variants: UTF-8 BOM, quoted commas, escaped quotes, embedded newlines, negative amounts, and repeated headers.
+  - Provides `computeIndependentNormalizedHash(items)` implementing the canonical NDJSON normalization contract independently of production helper functions to prove data integrity.
+  - Provides `computeIndependentDeterministicRowId(bundleHash, entityName, naturalKeyOrIndex)`, 5 fixed `GOLDEN_DETERMINISTIC_ROW_ID_VECTORS`, and `verifyHydratedRowIds(manifest, hydratedRows)` to verify hydrated row IDs bit-for-bit without circular dependencies on production functions.
+  - Computes precomputed oracles for expected raw SHA-256, normalized hash, canonical R2 keys (`rri-raw/...`, `rri-data/...`), and entity counts.
+- **Attributable Cleanup Registry (`scripts/canary/cleanup-registry.mjs`)**:
+  - Scoped run-ID tracking (`canary-<timestamp>-<hex>`) with SIGINT/SIGTERM emergency sweep handlers.
+  - Detects and inventories orphaned R2 keys (`orphanedR2Keys`) when D1 activation fails or aborts, tracking unmapped raw archives and bundle keys.
+  - Acknowledges HTTP 404 on `deleteBundle` as expected behavior when bundles are superseded during imports.
+  - Explicit outcome reporting distinguishing `CLEAN` from `FAILED` / `TEST PASS / CLEANUP PARTIAL` with remaining object inventories; never reports `CLEAN` if any resource is unaccounted for.
+- **Local Probe Suite (`scripts/probe-canary-automation.mjs`)**:
+  - 195th probe suite in repository, validating guard rejection, scheme safety, redirect credential stripping, dry-run invariants, redaction, determinism, concurrency races, hydration integrity and hash mismatch rejection, row ID golden vector parity and valid-looking mutated row ID rejection, missing and incorrect `x-normalized-hash` header rejection, failure cleanup in finally, bucket lock assertion/skip, and end-to-end local SQLite mock execution.
+- **Operator Manual & Environment Template**:
+  - `docs/CANARY_AUTOMATION.md` and `examples/canary.env.example`.
+
+## Configurable S3-compatible object transport — 2026-09-17
+
+`worker/r2-s3-adapter.js` provides an explicit S3-compatible transport for isolated
+canary Workers while Cloudflare Worker execution and D1 remain unchanged. Native
+`RAW_ARCHIVE` and `BULK_DATA` bindings remain the default. Generic mode activates
+only when `S3_ENABLED` is exactly `true` and atomically requires `S3_ENDPOINT`,
+`S3_RAW_BUCKET`, `S3_DATA_BUCKET`, `S3_ACCESS_KEY_ID`, and
+`S3_SECRET_ACCESS_KEY`. With no `S3_PROVIDER`, `S3_ENDPOINT` is restricted to the
+HTTPS Backblaze form `https://s3.<region>.backblazeb2.com`; the signing region is
+inferred from that endpoint. Optional `S3_REGION`, when present, must exactly match
+the inferred region. Backblaze bucket names are validated before a client is
+constructed.
+
+`S3_PROVIDER=gcs` selects Google Cloud Storage's JSON API at the exact endpoint
+`https://storage.googleapis.com`. This mode requires an explicit `S3_REGION` and
+`GCS_SERVICE_ACCOUNT_JSON`, containing the service account email and PKCS#8 private
+key. The JSON credential is a Worker secret and is never logged or committed. The
+free-tier canary location is `us-east1`, so both canary buckets and the configured
+region use `us-east1`. GCS bucket names and the endpoint are validated before a
+client is constructed.
+
+The existing Cloudflare R2 configuration remains backward-compatible. When generic
+mode is disabled, `R2_S3_ENABLED`, `R2_S3_ACCOUNT_ID`, `R2_S3_RAW_BUCKET`,
+`R2_S3_DATA_BUCKET`, `R2_S3_ACCESS_KEY_ID`, and `R2_S3_SECRET_ACCESS_KEY` retain the
+account-derived R2 endpoint and the `auto` signing region. Generic mode never falls
+back to legacy credentials when its configuration is incomplete.
+
+The adapter signs S3-compatible `HEAD`, `GET`, `PUT`, and `DELETE` requests with
+`aws4fetch`. Access keys are Worker secrets; code and error messages never contain
+their values or request signatures. Backblaze and R2 custom metadata maps through
+`x-amz-meta-*`, including RFC 2047 UTF-8 encoding. Their raw streaming uploads
+preserve the expected SHA-256 through `x-amz-content-sha256`, and write-once uploads
+use `If-None-Match: *`.
+
+GCS uses the JSON API with a short-lived OAuth bearer token minted from the service
+account JWT using Web Crypto RSASSA-PKCS1-v1_5/SHA-256. Resumable initiation is a
+JSON `POST` to `/upload/storage/v1/b/[BUCKET]/o?uploadType=resumable` without `name`
+in the query string (as GCS simple upload ignores request body when `name` is in query
+parameters). The request carries `Content-Type: application/json; charset=UTF-8` and
+`X-Upload-Content-Type` with an explicit `{ name, contentType, contentEncoding, metadata }`
+JSON body and `ifGenerationMatch=0`. The returned HTTPS session URI is the only capability
+used for subsequent unsigned chunk PUTs and the cancellation DELETE. The final PUT chunk
+also forwards lowercase `x-goog-meta-*` headers for robust metadata persistence. Metadata
+reads use the JSON object endpoint and media reads use `alt=media`, while deletes use the
+same JSON object endpoint. The adapter accepts session URIs only from `storage.googleapis.com`
+and never exposes their query strings. It streams in 256 KiB chunks with at most two chunks
+buffered, verifies the expected SHA-256 with the Workers `crypto.DigestStream` before the
+final commit, and sends a whole-object CRC32C in the final `x-goog-hash` header for server
+validation. HTTP 412 at initiation or final commit maps to the native R2 `null` result. The
+import pipeline then HEADs and verifies the winning canonical object before returning an
+idempotent 200 response. The default OAuth fetch callback wraps `globalThis.fetch` so workerd
+invokes it with the required global receiver; explicitly injected fetch callbacks remain
+unchanged. The adapter probe covers both paths after a live canary diagnostic reproduced
+workerd's `Illegal invocation` for the unbound default.
+
+All storage access, including raw-source verification during activation, passes
+through `getStores()`. `scripts/probe-r2-s3-adapter.mjs` proves legacy R2, Backblaze,
+and GCS configuration; OAuth JWT/token caching; JSON resumable initiation without
+query-string `name` to prevent metadata loss; URL encoding; bounded resumable chunk
+ranges; unsigned GCS session requests; atomic generation-zero creation; metadata and
+Unicode fidelity; SHA-256 and CRC32C handling; 404 and 412 mapping; session-URI and
+credential redaction; native fallback; default-fetch receiver safety; injected-fetch
+preservation; and removal of the direct-binding bypass without network access.
+
+The first remote Backblaze canary remains blocked until operators provide the RAW
+bucket, DATA bucket, bucket region and endpoint, plus a dedicated canary application
+`keyID` and `applicationKey` with Read/Write access restricted to those two buckets.
+The Backblaze master application key must not be used. Backblaze's public `PutObject`
+documentation does not document `If-None-Match: *`; therefore remote write-once
+behavior remains UNPROVEN until a credentialed canary confirms create and conflict
+behavior.
+
+The first remote GCS canary requires two private Standard buckets in `us-east1`, a
+dedicated service account restricted to object read/create/delete/list on only those
+buckets, and one service-account JSON credential installed as the canary
+`GCS_SERVICE_ACCOUNT_JSON` Worker secret. The private key is never stored in the
+repository. Rollback is to disable `S3_ENABLED` (or legacy `R2_S3_ENABLED`) and
+remove the corresponding canary Worker secret.
+
+## Canary Client Mutation Header & Redirect Hygiene — 2026-09-15
+
+`scripts/canary/canary-client.mjs` automatically sets `X-Requested-With: XMLHttpRequest` on mutation requests (`POST`, `PUT`, `PATCH`, `DELETE`) when not explicitly supplied by callers, satisfying Worker `sameOriginMutation()` requirements without mutating production worker auth logic. `GET` and `HEAD` requests do not receive this header automatically, and caller-provided values are preserved deterministically.
+
+Redirect handling enforces strict origin boundary isolation:
+- On cross-origin redirects, `Authorization`, `Cookie`, `X-Requested-With`, and `Origin` headers are stripped to prevent credential leaks and false same-origin claims.
+- When redirects convert mutations to `GET` (303 or standard POST/PUT -> GET redirects), mutation-only headers (`X-Requested-With`, `Content-Type`, `Content-Length`) are deleted.
+- Dry-run mode (`--dry-run`) remains strictly zero-network (`requestsDispatched === 0`), recording expected headers in planned requests without network dispatch.
+
+Validated locally in `scripts/probe-canary-automation.mjs` (Section 11B) across all 8 required behaviors with zero edge network dispatches.
+
+# Canary cleanup ownership
+
+The canary harness registers a bundle identity and its exact object key immediately after upload. If activation fails afterward, cleanup still deletes the pending bundle through that identity instead of classifying the object as an unmapped orphan. The automation probe covers the upload-success/activation-failure path.
+### Canary harness run isolation
+
+The live canary harness keeps smoke, import, and concurrency fixtures on
+distinct report families so a single `--all` run does not self-trigger the
+business overlap guard. Uploaded bundle keys are registered before activation,
+and hydration accepts runtimes that transparently decode gzip responses.
+
+### Self-contained live GCS benchmark runner
+
+`scripts/benchmark-live-gcs-canary.mjs` creates a fresh canary-only D1 fixture,
+starts a temporary Wrangler remote-D1 preview for real login, captures session
+cookies in memory, and drives non-overlapping smoke/import/hydration workflows
+at concurrency 2/5/10/20 plus a bounded manifest-read soak. It never targets
+the production Worker or production D1. Raw archive cleanup is retried with a
+temporary owner role after each child run, then the fixture and preview process
+are removed in `finally`; passwords, pepper, cookies, and storage credentials
+are never printed. `BENCHMARK_SOAK_MS` may shorten a rerun only when a prior
+full-duration soak remains the authoritative evidence.
+Raw cleanup retries transient login, transport, and destroy failures before the
+fixture account is removed, preserving exact-object cleanup ownership.
+Each matrix child includes the harness cleanup stage before the owner-role raw
+archive sweep, so successful uploads are never left solely to account deletion.
+### Live benchmark cohort isolation
+
+The live GCS benchmark uses disjoint fixture cohorts for the 2/5/10/20 workflow matrix. Each cohort is checked immediately before execution for `business_sync_state.revision = 0` and zero existing manifests. Cumulative fixture slices are prohibited because they reuse activated accounts and create false capacity failures.
+
+The benchmark parser accepts Wrangler's progress-prefixed JSON output so cohort state checks remain deterministic in interactive CLI environments.
+The runner also sets `CI=1` for Wrangler child processes to prevent progress UI from blocking machine-readable canary evidence.
+Fresh-cohort state reads use direct Wrangler `--command` queries rather than temporary SQL files.
+The matrix also performs an in-memory fixture invariant check before dispatch; the authoritative D1 fixture insert remains the preceding remote mutation gate.
+Workflow success is classified from smoke/import/hydration/large stages; cleanup is reported separately so a cleanup-registry failure cannot masquerade as a workflow-capacity failure. Fixture deletion is batched into one account cascade.
+
+### Explicit Report Replacement and Lineage Resolution (2026-09-24)
+
+When `/api/bulk-import/activate` encounters an active manifest for the same property, report type, and overlapping period:
+1. It queries candidate overlapping manifests and returns HTTP 409 `IMPORT_REPLACEMENT_REQUIRED` with `existing_bundle_id`, `existing_bundle` metadata, and `candidates`.
+2. When the caller explicitly provides `supersedes_bundle_id` and `expected_revision`, the Worker validates that the predecessor exists, is active, belongs to the same property and account, and matches the expected revision (protecting against concurrent modifications with `IMPORT_LINEAGE_CONFLICT`).
+3. D1 batch execution inserts the new manifest, marks the predecessor `superseded` (`active = 0`, `superseded_by_bundle_id = <new_id>`), updates `raw_file_archive` (`bundle_id = <new_id>`, `status = 'processed'`), and increments `business_sync_state.revision`.
+4. Both raw archives remain intact in object storage for immutable auditing. Tested in `scripts/probe-bulk-import-replacement-flow.mjs`.
+
+### Concurrent Activation Recovery and Revision Conflict Resolution (2026-09-24)
+
+When multiple report activations are dispatched concurrently (such as in batch uploads or parallel browser operations):
+1. **Request Body Stream Preservation**: In `worker/bulk-import.js`, JSON request bodies are parsed once upfront (`readJsonBody`) rather than inside the `retryRevision` loop, preventing body-stream consumption or clone exhaustion during retries across `activate`, `supersede`, and `delete`.
+2. **Jittered Exponential Backoff**: `retryRevision` catches retryable D1 constraint errors (`CHECK constraint failed: ok`, `UNIQUE constraint failed: business_change.account_id, business_change.seq`, etc.) and adds bounded jittered backoff (`30 * 2^attempt + random(0-40)ms`). This breaks lockstep collisions between concurrent Cloudflare Worker isolates and gives winning transactions time to commit.
+3. **Authoritative Re-evaluation**: On retry, `activateBundle` re-queries D1 state:
+   - If the winning transaction committed identical content (`normalized_hash`), it returns HTTP 200 `{ ok: true, status: 'already_active' }`, which the client handles as duplicate (recording 0 rows without failure).
+   - If the winning transaction committed an overlapping report (e.g. `Hotel Statistics.csv` and `Hotel Statistics (1).csv`), it throws HTTP 409 `IMPORT_REPLACEMENT_REQUIRED` with candidate predecessor metadata for explicit user replacement.
+   - If unrelated, it reads the incremented revision from `business_sync_state` and commits atomically.
+4. **Client-Side Bounded Retry**: In `src/lib/bulkImportPipeline.js`, `activateBundleOnServer` catches transient HTTP 409 `IMPORT_REVISION_CONFLICT` and retries with backoff up to 3 times, allowing the client to re-evaluate the authoritative committed state and preventing transient concurrency errors from surfacing as failures in the UI.
+5. **Guard Integrity**: All D1 transaction guards (`business_mutation_guard` `CHECK(ok=1)`, `business_change.seq` uniqueness) remain strictly enforced. Validated in `scripts/probe-bulk-import-concurrency-recovery.mjs`.
+
+### Atomic Multi-Predecessor Replacement and Relational Lineage (2026-09-24)
+
+When a consolidated or multi-quarter report (such as `Source Summary (1).csv` covering Jan 1 → Aug 2) is imported to replace multiple separate active reports (such as 3 quarterly reports covering the same period):
+1. **Generic Predecessor List**: `/api/bulk-import/activate` accepts `predecessors: [{ id, expected_revision }]` alongside backwards-compatible `supersedes_bundle_id`.
+2. **Strict Validation & Omission Fail-Closed**: Every predecessor in `predecessors` must exist, belong to the authorized account and property, match the report type, be currently active, match the expected revision, and actually overlap the date range or raw hash. Crucially, ALL active overlapping reports must be included in the replacement list; omitting any active overlap throws `IMPORT_REPLACEMENT_REQUIRED` with `missing_predecessor_ids` to prevent double-counting or partial overlaps.
+3. **Atomic Transaction & Single Revision Increment**: D1 batch execution marks all predecessors `superseded` (`status='superseded'`, `superseded_by_bundle_id = <successor_id>`), activates the successor (`status='active'`), inserts relational records into `import_bundle_lineage (account_id, successor_bundle_id, predecessor_bundle_id, created_at)` without comma-separated strings, updates `business_sync_state.revision` by exactly +1, and logs a single `business_change` event.
+4. **Backward Compatibility**: On the successor manifest, `supersedes_bundle_id` points to the primary predecessor (`predecessors[0].id`), maintaining full compatibility with all foreign keys and read-only audit queries.
+5. **Mutation Guard**: `business_mutation_guard` verifies at commit time behind `CHECK(ok=1)` that every predecessor is still active at its expected revision and no concurrent overlapping imports committed. Validated in `scripts/probe-bulk-import-multi-replacement.mjs`.
+
+
+## Import page reconciliation — 2026-09-24
+
+The Import page reads active bulk manifests from the server when business sync is enabled. This lets a fresh browser show a completed Source Summary or Hotel Statistics report even when its local history cache is empty. A failed queue card is cleared when the same property's file hash is active on the server. Repeated legacy Gross Revenue history rows with the same file hash show as one row, keeping the first import session that owns the data. Gross Revenue's parser type (`gross`) now uses the bulk path under the server's `gross_revenue` type for future imports.
+
+The production Hotel Statistics successor had already written its revision-2403 change event and superseded its predecessor, but its manifest still said `raw_archived`. A guarded one-row D1 repair marked that successor active; no source archive or report rows were deleted. The pending count then fell to zero.
+
+## Worker Fast-Path Aggregate Availability Contract & Schema Migration Status (2026-10-03)
+
+### Fast-Path Query Invariants & Table Absence Guards
+The `/api/aggregates/daily` handler in `worker/aggregates.js` provides server-authoritative daily aggregate summaries for headline KPI and dashboard rendering. In production environments where migrations `0008_property_day_summary.sql` and `0009_enterprise_settings_guard.sql` are pending owner APPROVAL (authenticated owner UI acceptance is a separate required proof), the handler enforces graceful degradation:
+
+1. **Narrow Table Absence Guards**: The primary query against `property_day_summary` parses the exact table identifier and is guarded strictly against exact missing-table errors (`no such table: property_day_summary` with observed SQLite/D1 wrappers, quotes, `: SQLITE_ERROR`, closed numeric error codes, or `main`/`temp` schema qualification). Punctuation and suffix lookalikes (`property_day_summary_backup`, `property_day_summary-history`, `property_day_summary.backup`, `property_day_summary(backup)`, `property_day_summary:backup`), foreign schemas, views (`no such view`), and unexpected engine errors (disk I/O, D1 quotas, syntax errors, missing `property` table) are never swallowed and are rethrown immediately.
+2. **Business Sync State Optimization**: When primary rows are empty (`rows.length === 0`) or absent, the secondary query against `business_sync_state` is skipped entirely, preventing spurious table or query errors on unmigrated accounts.
+3. **Graceful Fallback to Legacy Aggregates**: If the primary table is absent, empty, or stale (`source_manifest_revision` mismatch against `business_sync_state.revision`), the handler queries `daily_financial_aggregate` with an equivalent exact table-absence guard (`no such table: daily_financial_aggregate`).
+4. **Explicit Availability Contract & Client Fallback**:
+   - When valid current primary records exist: `{ ok: true, summaries: [...], count: N, source: "property_day_summary", available: true }`.
+   - When valid historical legacy records exist: `{ ok: true, summaries: [...], count: N, source: "daily_financial_aggregate", available: true }` with exact integer-cents conversion.
+   - When both tables are absent, empty, or stale with no fallback: `{ ok: true, summaries: [], count: 0, source: "empty", available: false }` with HTTP 200.
+   - Client consumers (`useHotelData.js`, `Dashboard.jsx`) require a non-empty complete property summary and source validation (`source === 'property_day_summary'`). The explicit `available: false` API contract combined with empty rows (`summaries: []`) forces client fallback to live ledger reconciliation without synthesizing false zero KPIs.
+
+### Schema Migration Status & Fallback Candidate
+- **Production Baseline**: The production database ledger reflects migrations `0001` through `0007`. Neither `property_day_summary` nor `daily_financial_aggregate` exists in the baseline production ledger.
+- **Additive DDL Rehearsal**: Migrations `0008_property_day_summary.sql` and `0009_enterprise_settings_guard.sql` have been rehearsed and verified as strictly additive, idempotent, and non-destructive on synthetic fixtures (74/74 assertions PASS).
+- **Deployment Status**: Migrations `0008` and `0009` have **NOT** been applied to production, pending owner APPROVAL (authenticated owner UI acceptance is a separate required proof). In the interim, the guarded Worker fast-path availability contract serves as the active, safe fallback candidate.

@@ -1,0 +1,1126 @@
+import { adaptPmsGrid } from '@/lib/pmsAdapters';
+import { getPropertyProfile } from '@/lib/enterpriseConfigEngine';
+import {parseWorkbookInWorker} from "./workbookParser";
+import { db, runInTransaction, createImportSession, completeImportSession, failImportSession, addImportRecordIds } from '@/api/base44Client';
+
+import {
+  fetchCsvRows, parseTextInWorker, MAX_IMPORT_BYTES, convertDate, isIsoDate, parseAmount, isCsvFile,
+} from "@/lib/csvParser";
+
+import {
+  assignDedupeKeys,
+} from '@/lib/transactionNorm';
+import { neutralizeFormula } from '@/lib/securityUtils';
+import { validateImport, makeFinding, recordCoercion, SEVERITY } from '@/lib/importValidation';
+import { detectAnomalies, detectClerkAnomalies } from '@/lib/anomalyDetector';
+// Statically imported on purpose. This used to be `await import()` at the point of
+// use, inside the timecard import — which runs in a Dexie transaction zone. A
+// dynamic import is a macrotask, so awaiting one leaves the zone and Dexie commits
+// early: PrematureCommitError, mid-import, with rows already written (blocker B6).
+// timecardCalc only pulls in @/lib/decimal, so there is no cycle to avoid here.
+import { normalisePunch } from '@/lib/timecardCalc';
+import { dedupByKey, withLazyObjects, detectReportType } from '@/lib/reportGrid';
+import { scanTransactions } from '@/lib/parsers/transactions';
+import { scanHotelStatistics } from '@/lib/parsers/hotelStatistics';
+import { scanAdjustmentsRefunds } from '@/lib/parsers/adjustmentsRefunds';
+import { scanClerkReport } from '@/lib/parsers/clerk';
+import { scanTimecard } from '@/lib/parsers/timecard';
+export { neutralizeFormula };
+export { scanAdjustmentsRefunds };
+
+// Serialize report imports to prevent double-click/parallel duplicate writes.
+let importQueue = Promise.resolve();
+async function _serial(target) {
+  const run = importQueue.then(
+    () => target,
+    () => target
+  );
+  importQueue = run.catch(() => {});
+  return run;
+}
+
+// Post-import integrity pass: remove duplicate rows (same entity key) within a
+// property, keeping the earliest-created copy. Fixes duplicates from past
+// imports, double-clicks, and files imported twice under different names.
+async function dedupePropertyRows(entity, propertyId, keyFn) {
+  try {
+    // Reading the property's whole history is the point here — this pass also
+    // clears duplicates left by earlier imports, so it cannot be narrowed to the
+    // dates in the file just landed. It is index-driven either way: planQuery()
+    // turns { property_id } into property_id.equals(). What is gone is the 100000
+    // cap. Sorted ascending by created_date and then sliced, the rows it dropped
+    // were the NEWEST ones — the rows this import just wrote. A property past that
+    // many rows would have had the dedupe pass silently stop covering exactly the
+    // rows it exists to check. The cap never bounded memory: the proxy
+    // materializes the whole table before slicing it.
+    const all = await db.entities[entity].filter(propertyId ? { property_id: propertyId } : {}, "created_date");
+    const seen = new Map();
+    const removeIds = [];
+    for (const r of all) {
+      const k = keyFn(r);
+      const cur = seen.get(k);
+      if (!cur) {
+        seen.set(k, r);
+        continue;
+      }
+      const curCreated = new Date(cur.created_date || 0).getTime();
+      const rCreated = new Date(r.created_date || 0).getTime();
+      if (rCreated < curCreated || (rCreated === curCreated && Number(r.id) < Number(cur.id))) {
+        removeIds.push(cur.id);
+        seen.set(k, r);
+      } else {
+        removeIds.push(r.id);
+      }
+    }
+    if (removeIds.length) {
+      await db.entities[entity].bulkDelete(removeIds);
+    }
+    return removeIds.length;
+  } catch (e) {
+    console.warn('[reportParsers] cleanup pass skipped:', e.message);
+    return 0;
+  }
+}
+
+// Track IDs of created records so rollback can delete exactly what an import
+// wrote — no date-range guessing, no collateral damage to rows that were
+// already there.
+//
+// Writes to ImportRecordIds, NOT to the lifecycle session in base44Client.js.
+// Those were both called "ImportSession" until v11; see localDb.js for why.
+//
+// Failing to record ids would leave an import that cannot be undone, so this
+// rethrows: the caller runs inside the import transaction, and losing the
+// rollback ledger should abort the import rather than silently produce
+// unremovable rows.
+async function recordCreatedIds(entity, propertyId, importId, ids) {
+  await addImportRecordIds(importId, entity, ids, propertyId || "");
+}
+
+// Run the anomaly engine over newly imported transaction rows and persist any
+// flagged alerts for owner review. Idempotent: alerts carry a dedupe_key, so a
+// force re-import never stacks a second copy. Created ids go into the rollback
+// ledger, so an undo also removes the alerts the import produced.
+async function persistAnomalyAlerts(rows, meta) {
+  const propertyId = meta.propertyId ?? "";
+  const alerts = detectAnomalies((rows || []).map(row => ({
+    ...row,
+    property_id: propertyId,
+    property_name: meta.propertyName || "",
+  })));
+  if (!alerts.length) return { count: 0, audit: null };
+
+  const stamped = alerts.map((a) => ({
+    ...a,
+    property_id: propertyId,
+    property_name: meta.propertyName || "",
+    import_id: meta.importId || "",
+    source_file: meta.sourceFile || "",
+    status: "open",
+  }));
+
+  const existing = propertyId
+    ? await db.entities.AnomalyAlert.filter({ property_id: propertyId })
+    : [];
+  const seen = new Set(existing.map((a) => a.dedupe_key));
+  const fresh = stamped.filter((a) => !seen.has(a.dedupe_key));
+
+  let createdIds = [];
+  if (fresh.length) {
+    for (let i = 0; i < fresh.length; i += 400) {
+      const batch = fresh.slice(i, i + 400);
+      const created = await db.entities.AnomalyAlert.bulkCreate(batch);
+      createdIds.push(...created.map((r) => r.id));
+    }
+  }
+  if (createdIds.length) {
+    await recordCreatedIds("AnomalyAlert", propertyId, meta.importId, createdIds);
+  }
+  // Returns an audit descriptor so the HMAC audit-log entry is written by the
+  // caller AFTER the import transaction commits — logging inside the transaction
+  // would race Dexie's auto-commit and either roll back with the import or throw
+  // a PrematureCommitError. A post-commit write only records what actually stuck.
+  const types = [...new Set(fresh.map((a) => a.alert_type))].sort();
+  return {
+    count: createdIds.length,
+    audit: createdIds.length
+      ? { propertyId, propertyName: meta.propertyName || "", importId: meta.importId || "", count: createdIds.length, types }
+      : null,
+  };
+}
+
+export const REPORT_TYPES = [
+  { key: "auto", label: "Auto-detect (recommended)" },
+  { key: "occupancy", label: "Occupancy Summary" },
+  { key: "source", label: "Source Summary" },
+  { key: "gross", label: "Gross Revenue" },
+  { key: "payments", label: "Payments Summary" },
+  { key: "clerk", label: "Clerk Shift & Cash Audit" },
+  { key: "hotel_statistics", label: "Hotel Statistics (Universal)" },
+  { key: "transactions", label: "All Transactions (Ledger)" },
+  { key: "adjustments_refunds", label: "Adjustments & Refunds Activity" },
+  { key: "timecard", label: "Timecard (Clock In/Out)" },
+  { key: "generic", label: "Any other spreadsheet" },
+];
+
+const COLUMN_MAP = {
+  Date: "date", date: "date",
+  "Day Of Week": "day_of_week", "Day of Week": "day_of_week", "day_of_week": "day_of_week",
+  Code: "code", code: "code",
+  Source: "source", source: "source",
+  "Net Revenue": "net_revenue", net_revenue: "net_revenue",
+  Stays: "stays", stays: "stays",
+  ADR: "adr", adr: "adr",
+  "Occupancy Contribution": "occupancy_contribution", occupancy_contribution: "occupancy_contribution",
+  "RevPAR Contribution": "revpar_contribution", "Revpar Contribution": "revpar_contribution",
+  revpar_contribution: "revpar_contribution",
+  "Room Revenue": "room_revenue", room_revenue: "room_revenue",
+  "Other Room Revenue": "other_room_revenue", other_room_revenue: "other_room_revenue",
+  "Total Revenue": "total_revenue_with_misc", total_revenue: "total_revenue_with_misc",
+  "Total Rooms": "total_rooms", total_rooms: "total_rooms",
+  "Total Sold Rooms": "rooms_sold", "Total Sold Rooms ": "rooms_sold",
+  "Sold Rooms Without Comp": "rooms_sold_without_comp",
+  "Down Rooms": "down_rooms", "Vacant Rooms": "vacant_rooms",
+  "Clean Rooms": "clean_rooms", "Dirty Rooms": "dirty_rooms",
+  "Stayover Rooms": "stayover_rooms", "Same Day Bookings": "same_day_bookings",
+  "Comp Rooms": "comp_rooms", "House Rooms": "house_rooms",
+  "Zero Rate Rooms": "zero_rate_rooms", "Day Use Rooms": "day_use_rooms",
+  "Total No Shows": "no_shows", "Total Cancellations": "cancellations",
+  "Total Guests": "total_guests",
+  // The Occupancy Summary export prints FOUR occupancy columns, one per denominator
+  // convention, all in percent form (19 means 19%). Only ONE is mapped, deliberately:
+  //
+  //   Occupancy Including OOO Comp and House Use            <- mapped
+  //   Occupancy Excluding OOO Comp and House Use            <- not mapped
+  //   Occupancy Including OOO Excluding Comp and House Use  <- not mapped
+  //   Occupancy Excluding OOO Including Comp and House Use  <- not mapped
+  //
+  // Mapping more than one would be a silent bug rather than extra coverage: mapRow
+  // iterates Object.entries, so the last matching column in the row would overwrite
+  // the earlier ones and which definition "won" would depend on column order.
+  //
+  // The one chosen is the one that matches the audited room counts. Measured over
+  // `scripts/data/Occupancy Summary midelboro.csv`: 214 rows compared,
+  // `Total Sold Rooms / Total Rooms x 100` equals this column on every row, 0
+  // mismatches at 2dp. The other three use denominators the data model does not carry
+  // (out-of-order, comp and house-use rooms are separate columns), so importing them
+  // as "occupancy" would mean four different numbers under one name.
+  //
+  // ADDED 2026-08-20. Before this, no header spelling mapped to `occupancy` at all,
+  // even though `occupancy` is in NUMERIC_FIELDS and is a declared field on the
+  // OccupancyDay entity. Consequences, in order of how quietly each one failed:
+  //   1. Every import of a clean Occupancy Summary raised an `unknown_columns`
+  //      warning naming all four columns. A warning that fires on every good file
+  //      trains the owner to dismiss the one that matters.
+  //   2. A file with sold rooms but no `Total Rooms` imported occupancy as 0 — a full
+  //      hotel recorded as empty, and it propagates into ADR and RevPAR.
+  //   3. The percent-form branch in scanReport was unreachable, so it could not be
+  //      tested. See the DEFECT FIXED note there.
+  // This mapping changes no imported value for the real file (room counts are present
+  // and still take precedence); it only makes the fallback reachable and correct.
+  "Occupancy Including OOO Comp and House Use": "occupancy",
+  "Revpar With OOO Rooms": "revpar", "Revpar Without OOO Rooms": "revpar_without_ooo",
+  "RevPAR With OOO Rooms": "revpar", "RevPAR Without OOO Rooms": "revpar_without_ooo",
+  "Room Rent": "room_rent", "Misc Charge": "misc_charge",
+  System: "system_charge", Food: "food", Event: "event", Bar: "bar",
+  Laundry: "laundry", Phone: "phone", Other: "other",
+  "State Tax": "state_tax", "state tax": "state_tax",
+  "City Tax": "city_tax", "city tax": "city_tax",
+  "City/County Tax": "city_tax", "Local Tax": "city_tax", "Local City Tax": "city_tax",
+  "Other Tax": "other_tax", "other tax": "other_tax",
+  "Non Revenue": "non_revenue", "Advance Deposit": "advance_deposit", Beverage: "beverage",
+  CASH: "cash", CHECK: "check",
+  "CLOSED BALANCE FOLIO": "closed_balance_folio", CORPAY: "corpay",
+  "DIRECT BILL": "direct_bill", AMEX: "amex", DISCOVER: "discover",
+  MASTER: "master", VISA: "visa",
+  // The Payments Summary prints its tender columns in all-caps, so `OTHER` never
+  // matched the `Other: "other"` entry above (this map is exact-match, not
+  // case-folded). ADDED 2026-08-20: `other` is a DECLARED field on the PaymentDay
+  // entity, so the schema always expected this column — only the mapping was missing,
+  // and the tender was dropped from the method breakdown without a word.
+  //
+  // Measured impact on existing data: nil. Across all three real Payments Summary
+  // files (217 rows) the OTHER column is 0.00 on every row, so no historical figure
+  // moves. The defect was latent: the first day a guest settles through an "other"
+  // tender, the per-method breakdown stops summing to the printed `Total` and the
+  // difference has nowhere to show up.
+  OTHER: "other",
+  "LOYALTY CERTIFICATE": "loyalty_certificate", "LOYALTY DISCOUNT": "loyalty_discount",
+  "VIP PASS": "vip_pass", "WIRE TRANSFER": "wire_transfer",
+  Total: "total", TOTAL: "total",
+};
+
+const NUMERIC_FIELDS = new Set([
+  "room_revenue", "other_room_revenue", "total_revenue", "total_rooms", "rooms_sold",
+  // The occupancy export's "Total Revenue" column maps here (see COLUMN_MAP), so
+  // this MUST be a numeric field or mapRow stores the raw CSV STRING — "$5,713.42"
+  // as text — and every consumer summing the field silently reads 0. Found because
+  // scripts/acceptance-harness.mjs compared this exact figure against the source
+  // file and got dash=0 while every room-level metric passed. Anything added to
+  // COLUMN_MAP that carries a number belongs in this set too.
+  "total_revenue_with_misc",
+  "rooms_sold_without_comp", "down_rooms", "vacant_rooms", "clean_rooms", "dirty_rooms",
+  "stayover_rooms", "same_day_bookings", "comp_rooms", "house_rooms", "zero_rate_rooms",
+  "day_use_rooms", "no_shows", "cancellations", "total_guests", "adr", "occupancy", "revpar",
+  "revpar_without_ooo",
+  "net_revenue", "stays", "room_rent", "misc_charge", "system_charge", "food", "event",
+  "bar", "laundry", "phone", "other", "non_revenue", "advance_deposit", "beverage",
+  "occupancy_contribution", "revpar_contribution",
+  "actual", "adjusted", "net_today", "amount", "transaction_count",
+  "cash", "check", "closed_balance_folio", "corpay", "direct_bill", "amex", "discover",
+  "master", "visa", "loyalty_certificate", "loyalty_discount", "vip_pass", "wire_transfer",
+  "state_tax", "city_tax", "other_tax",
+  "total",
+]);
+
+// The report-type -> store map. EXPORTED 2026-08-20 so that the set of stores an
+// import writes to is declared exactly once. src/lib/importReset.js derives what a
+// "clear all imported data" must empty from these values, because the previous
+// arrangement kept a second, hand-copied list of table names inside a React event
+// handler in src/pages/Import.jsx — and that copy was already two entries short.
+// Adding a report type here now also teaches clear-all about it.
+export const ENTITY = {
+  occupancy: "OccupancyDay",
+  source: "SourceDay",
+  gross: "GrossRevenueDay",
+  payments: "PaymentDay",
+  hotel_statistics: "HotelMetric",
+  transactions: "TransactionLine",
+  adjustments_refunds: "AdjustmentRefund",
+};
+const _REVENUE_COL = {
+  occupancy: "room_revenue",
+  source: "net_revenue",
+  gross: "room_rent",
+  payments: "total",
+};
+
+function mapRow(obj, coercions) {
+  const out = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (value === null || value === undefined || value === "") continue;
+    const fieldName = COLUMN_MAP[key];
+    if (fieldName) {
+      if (NUMERIC_FIELDS.has(fieldName)) {
+        const raw = String(value).trim();
+        const parsed = parseAmount(raw);
+        // Logged through the shared classifier so this path and the transaction
+        // ledger's mapper describe an identical value identically. Unparseable
+        // values are still kept as 0 (matching the old behaviour) — the log is
+        // what stops that 0 from looking like a real zero.
+        recordCoercion(coercions, fieldName, raw, parsed);
+        out[fieldName] = parsed === null ? 0 : parsed;
+      } else {
+        out[fieldName] = value;
+      }
+    }
+  }
+  return out;
+}
+
+function addMeta(obj, meta) {
+  return {
+    ...obj,
+    property_id: meta.propertyId ?? "",
+    property_name: meta.propertyName || "",
+    import_id: meta.importId || "",
+    source_file: meta.sourceFile || "",
+    report_type: meta.type || "",
+  };
+}
+
+async function skipExisting(entity, rows, keyFn, propertyId) {
+  if (!rows || rows.length === 0) return [];
+
+  const filter = propertyId ? { property_id: propertyId } : {};
+  
+  // Optimization: Find the relevant date field used in this entity to limit the scan.
+  const sample = rows[0];
+  let dateField = null;
+  if ('date' in sample) dateField = 'date';
+  else if ('business_date' in sample) dateField = 'business_date';
+  else if ('shift_date' in sample) dateField = 'shift_date';
+  else if ('review_date' in sample) dateField = 'review_date';
+
+  let existing = [];
+  // No row cap on any of these three reads. `seen` below decides which incoming
+  // rows are duplicates, so a truncated read does not merely slow things down —
+  // it makes rows that ARE already stored look new and imports them a second
+  // time. Both fallback branches sorted ascending and sliced, so the rows they
+  // dropped were the most recent ones, which is where duplicates actually cluster.
+  if (dateField) {
+    const dates = [...new Set(rows.map(r => r[dateField]).filter(Boolean))];
+    if (dates.length > 0) {
+       // planQuery() plans this as date.anyOf(dates) for `date`/`shift_date`
+       // entities. `business_date` and `review_date` are indexed but are not in
+       // its driver list, so those two fall back to property_id.equals() — a
+       // wider scan, same rows.
+       filter[dateField] = { $in: dates };
+       existing = await db.entities[entity].filter(filter, dateField);
+    } else {
+       existing = await db.entities[entity].filter(filter, "created_date");
+    }
+  } else {
+    existing = await db.entities[entity].filter(filter, "created_date");
+  }
+
+  const seen = new Set(existing.map(keyFn));
+  
+  // Also track import_ids to prevent cross-session duplicates
+  const seenImportIds = new Set(
+    existing.filter(r => r.import_id).map(r => r.import_id)
+  );
+  
+  return rows.filter((r) => {
+    // Check business key duplicate
+    if (seen.has(keyFn(r))) return false;
+    // Check import_id duplicate (prevent re-importing same session)
+    if (r.import_id && seenImportIds.has(r.import_id)) return false;
+    return true;
+  });
+}
+
+// CSV injection defense (neutralizeFormula) belongs ONLY on export — see
+// hotel.js csvCell. It must NEVER be applied on import: prefixing a value like
+// '-12.50' with an apostrophe before parsing corrupts numeric data into NaN.
+async function getRowsArray(type, fileUrl, meta) {
+  if (meta?.rawBytes && /\.xlsx?$/i.test(meta.sourceFile || '')) {
+    const csv = await parseWorkbookInWorker(meta.rawBytes);
+    return withLazyObjects(await parseTextInWorker(csv));
+  }
+  // If CSV text was pre-read from the File object, parse it in the worker (no
+  // fetch needed). This branch used to call parseCsvText synchronously on the
+  // main thread with no size guard, so a 100k-row paste froze the tab and
+  // bypassed the ceiling fetchCsvRows enforces. Offloading here fixes both.
+  if (meta?.csvText) {
+    if (String(meta.csvText).length > MAX_IMPORT_BYTES) {
+      throw new Error(`File exceeds ${MAX_IMPORT_BYTES / (1024 * 1024)}MB size limit`);
+    }
+    return withLazyObjects(await parseTextInWorker(meta.csvText));
+  }
+  // Use sourceFile for detection if available, fallback to fileUrl
+  const checkUrl = meta?.sourceFile || fileUrl;
+  if (isCsvFile(checkUrl)) {
+    return withLazyObjects(await fetchCsvRows(fileUrl));
+  }
+  // Excel fallback — use AI extraction
+  const schema = {
+    type: "object",
+    properties: Object.fromEntries(
+      Object.keys(COLUMN_MAP).filter((k) => k === k).slice(0, 10).map((k) => [k, { type: "string" }])
+    ),
+  };
+  const res = await db.integrations.Core.ExtractDataFromUploadedFile({
+    file_url: fileUrl,
+    json_schema: schema,
+  });
+  if (res.status !== "success") throw new Error(res.details || "Extraction failed");
+  const eager = (Array.isArray(res.output) ? res.output : []).map((obj) => {
+    const safe = {};
+    for (const [k, v] of Object.entries(obj || {})) safe[k] = v;
+    return safe;
+  });
+  return withLazyObjects([], eager);
+}
+
+export async function scanReport(type, fileUrl, meta = {}) {
+  // Note: `source.objects` is a lazy getter — destructuring it here would defeat
+  // the point, so it is read only inside the branches that need object form.
+  const original = await getRowsArray(type, fileUrl, meta);
+  const adapter = meta.pmsAdapter || getPropertyProfile(meta.propertyId)?.pms || 'hotelkey';
+  const adapted = adaptPmsGrid(original.rawRows, {adapter,type,propertyId:meta.propertyId});
+  if (adapter !== 'hotelkey' && !original.rawRows.length) throw new Error('This PMS adapter needs a CSV with a business-date header.');
+  const source = adapter === 'hotelkey' ? original : withLazyObjects(adapted.rawRows);
+  const rawRows = source.rawRows;
+  const requestedType = adapter === 'hotelkey' ? type : adapted.type;
+  const resolvedType = !requestedType || requestedType === 'auto' ? detectReportType(fileUrl, rawRows, meta) : requestedType;
+  const fullMeta = { ...meta, type: resolvedType, pms_adapter: adapter };
+
+  if (resolvedType === "hotel_statistics") {
+    return scanHotelStatistics(rawRows, fileUrl, fullMeta);
+  }
+
+  if (resolvedType === "transactions") {
+    return scanTransactions(rawRows, fullMeta);
+  }
+
+  const objects = source.objects;
+
+  // Debug info for troubleshooting
+  const debugInfo = {
+    rawRowCount: rawRows?.length || 0,
+    objectCount: objects?.length || 0,
+    detectedType: resolvedType,
+    sampleHeaders: rawRows?.[0] || [],
+    sampleObject: objects?.[0] || null,
+  };
+
+  if (resolvedType === "generic") {
+    const rows = objects.filter((r) => Object.values(r).some((v) => v !== null && v !== ""));
+    return {
+      type: resolvedType,
+      sections: [{ name: "Data", rows: rows.length, preview: rows.slice(0, 20) }],
+      totalRows: rows.length,
+      rowsToImport: rows,
+      meta: fullMeta,
+      debug: debugInfo,
+    };
+  }
+
+  if (resolvedType === "clerk") {
+    return scanClerkReport(rawRows, fullMeta, objects);
+  }
+
+  if (resolvedType === "adjustments_refunds") {
+    return scanAdjustmentsRefunds(rawRows, fullMeta);
+  }
+
+  if (resolvedType === "timecard") {
+    return scanTimecard(rawRows, fullMeta, objects);
+  }
+
+  // Occupancy, Source, Gross, Payments — flat tables
+  const coercions = [];
+  const mapped = objects.map((obj) => mapRow(obj, coercions)).filter((r) => Object.keys(r).length > 0);
+
+  // Convert dates and fix occupancy
+  const processed = mapped
+    .map((r) => {
+      if (r.date) {
+        const converted = convertDate(r.date);
+        if (!converted || !isIsoDate(converted)) {
+          // Track failed date conversions for debugging
+          r._dateParseError = r.date;
+        }
+        r.date = converted;
+      }
+      // Occupancy arrives in two forms depending on the PMS export: a ratio (0.85)
+      // or a percentage (85). Room counts, when present, are two audited integers and
+      // are preferred over either printed form.
+      //
+      // DEFECT FIXED 2026-08-20 — DO NOT COLLAPSE THESE BRANCHES BACK. The code was:
+      //
+      //     if (!r.occupancy || r.occupancy > 1) { ...sold/total, else 0... }
+      //     else if (r.occupancy > 1) { r.occupancy = r.occupancy / 100; }
+      //
+      // The `else if` is unreachable: the `if` above it already caught every value
+      // > 1. So an export that prints occupancy as `85` with no room-count columns
+      // fell into the first branch, found total === 0, and was assigned **0** — the
+      // percentage was thrown away and the day was recorded as an empty hotel. Silent,
+      // no warning, and it survives into ADR and RevPAR because those read occupancy.
+      //
+      // Only the `printed > 1 && total === 0` case changes behaviour here. Every other
+      // input produces exactly what it produced before, which is what makes this safe
+      // to apply to historical re-imports.
+      //
+      // BEST OUTCOME NOTE: a ratio already in (0, 1] is left EXACTLY as imported even
+      // when room counts are present. Recomputing it from the counts would silently
+      // overwrite what the PMS printed, and a disagreement between the printed ratio
+      // and sold/total is a data-quality signal the owner should see rather than one
+      // this parser should paper over.
+      if (resolvedType === "occupancy") {
+        const printed = Number(r.occupancy);
+        if (!printed || printed > 1) {
+          const sold = Number(r.rooms_sold) || 0;
+          const total = Number(r.total_rooms) || 0;
+          if (total > 0) {
+            r.occupancy = sold / total;
+          } else if (printed > 1) {
+            // Percent form with nothing to derive from. Values over 100 stay over 1
+            // on purpose: >100% occupancy is the signal for a duplicated import.
+            r.occupancy = printed / 100;
+          } else {
+            r.occupancy = 0;
+          }
+        }
+      }
+      return r;
+    })
+    .filter((r) => {
+      const valid = r.date && isIsoDate(r.date);
+      if (!valid && r._dateParseError) {
+        debugInfo.dateParseErrors = (debugInfo.dateParseErrors || 0) + 1;
+      }
+      return valid;
+    });
+
+  // Validation runs on the raw grid + mapped rows so the scan preview can show
+  // what would be corrupted before anything is imported. Errors block the
+  // import unless force-imported; warnings only display.
+  //
+  // ADDED 2026-08-20 — the occupancy default disarmed a required-column check.
+  //
+  // `REQUIRED_FIELDS.occupancy` in importValidation.js demands one of `occupancy` or
+  // `rooms_sold`, and it decides "present" by looking for the field on a mapped row.
+  // The branch above always writes `r.occupancy`, including the `= 0` fallback — so a
+  // file carrying neither an occupancy column nor room counts arrived at the
+  // validator with `occupancy: 0` on every row, satisfied the requirement, and
+  // imported with **no findings at all**. Every day recorded as an empty hotel, and
+  // the one layer built to catch exactly that had been switched off by an upstream
+  // default. Found by scripts/probe-validation-gaps.mjs, which asserts the finding.
+  //
+  // Reported through `extraFindings` rather than by removing the `= 0` default: the
+  // default is what keeps `occupancy` a number for every downstream consumer, and
+  // `extraFindings` is the sanctioned channel for "a problem only the parser that
+  // owns this format can see". No imported value changes.
+  //
+  // The all-rows-affected escalation mirrors `unparseable_dates` in the same module
+  // instead of inventing a second convention: a whole file of underivable rows is a
+  // wrong-file error, while a handful is a warning that must not block the rest.
+  const underivable = resolvedType === "occupancy"
+    ? processed.filter((r) => Number(r.occupancy) === 0 && !(Number(r.total_rooms) > 0)).length
+    : 0;
+  const extraFindings = [];
+  if (underivable) {
+    const all = underivable === processed.length;
+    extraFindings.push(makeFinding(
+      "structural",
+      all ? SEVERITY.ERROR : SEVERITY.WARNING,
+      "occupancy_underivable",
+      all
+        ? `No occupancy could be determined for any of the ${underivable} row(s): the file has neither a recognised occupancy column nor "Total Rooms". Every day would import as an empty hotel. This may not be an Occupancy Summary.`
+        : `${underivable} row(s) have no occupancy and no "Total Rooms" to derive it from, so they imported as 0% — an empty hotel for those days.`,
+      { count: underivable, rows: processed.length },
+    ));
+  }
+
+  const validation = validateImport({
+    rawRows,
+    rows: processed,
+    type: resolvedType,
+    knownColumns: new Set(Object.keys(COLUMN_MAP)),
+    coercions,
+    dateFailures: debugInfo.dateParseErrors || 0,
+    extraFindings,
+  });
+
+  return {
+    type: resolvedType,
+    sections: [{ name: REPORT_TYPES.find((r) => r.key === resolvedType)?.label || resolvedType, rows: processed.length, preview: processed.slice(0, 20) }],
+    totalRows: processed.length,
+    rowsToImport: processed,
+    meta: fullMeta,
+    debug: debugInfo,
+    validation,
+  };
+}
+
+// ─── CSV report importer ────────────────────────────────────────────────
+
+// Existing-row dedupe read for the TransactionLine ledger, bounded by the
+// incoming date window instead of the whole property history.
+//
+// A duplicate is defined by transactionDedupeKey (src/lib/transactionNorm.js),
+// whose SECOND component is the row's ISO date. A stored row can therefore only
+// collide with an incoming row when they share a date, which makes the incoming
+// date window a LOSSLESS filter: reading only [minDate, maxDate] over the
+// [property_id+date] index cannot miss a duplicate, and planQuery() in
+// base44Client.js already compiles { property_id, date:{$gte,$lte} } into a
+// .between() on that compound index. The upper bound is padded with U+FFFF
+// because a legacy row may store its date as a full timestamp
+// ("2026-01-31T23:30:00Z"); an unpadded between() would clip it out of the 31st
+// and make an already-stored row look new — a double-import on the ledger that
+// has to reconcile to the cent.
+//
+// If ANY incoming row lacks a clean ISO date (so the key's date component is not
+// order-comparable), the bound is dropped and the full property read is used —
+// correctness over the optimization. Selection is byte-identical to the old
+// full-table scan either way; only the number of rows materialised changes.
+export async function existingTxnDedupeKeys(entity, propertyId, rows) {
+  const query = propertyId ? { property_id: propertyId } : {};
+  let lo = null, hi = null, bounded = true;
+  for (const r of rows) {
+    const d = String(r.date || "");
+    if (!isIsoDate(d)) { bounded = false; break; }
+    const day = d.slice(0, 10);
+    if (lo === null || day < lo) lo = day;
+    if (hi === null || day > hi) hi = day;
+  }
+  if (bounded && lo !== null) {
+    query.date = { $gte: lo, $lte: `${hi}￿` };
+  }
+  const existing = await entity.filter(query, "date");
+  return new Set(existing.map((r) => r.dedupe_key));
+}
+
+export async function importReport(scanResult, meta = {}) {
+  const { forceImport = false, sourceFile = "", propertyId = "", propertyName = "", ...restMeta } = meta;
+
+  // Fail-closed at the persist boundary: a missing, empty, whitespace-only, or
+  // non-string propertyId is refused before any session or row is created.
+  // Downstream, addMeta stamps `property_id: propertyId || ""` and skipExisting
+  // degrades an empty id to `filter({})` — a dedupe/scan across EVERY property.
+  // Refusing here keeps the "Property A cannot see Property B" isolation
+  // invariant intact even when a non-UI caller reaches this boundary without a
+  // property selected. The UI already disables import while none is chosen; this
+  // is defense-in-depth for every other path.
+  if (typeof propertyId !== "string" || propertyId.trim() === "") {
+    const err = /** @type {Error & { code: string }} */ (new Error("Import refused: a non-empty propertyId is required to persist rows (property isolation boundary)."));
+    err.code = "IMPORT_PROPERTY_REQUIRED";
+    throw err;
+  }
+
+  // Block corrupting imports unless the user explicitly forces them. The scan
+  // already showed these errors in the preview; without force, a file that
+  // fails validation is rejected before any session or row is created, so no
+  // `in_progress` session is left behind for an import that never happened.
+  const validation = scanResult?.validation;
+  if (validation && !validation.ok && !forceImport) {
+    const layer = validation.firstFailingLayer || "validation";
+    const detail = validation.errors.map((f) => `${f.code}: ${f.message}`).join(" | ");
+    const err = /** @type {Error & { code: string, validation: typeof validation }} */ (new Error(`Import blocked by ${layer} validation (${validation.errors.length} error(s)): ${detail}`));
+    err.code = "IMPORT_VALIDATION_BLOCKED";
+    err.validation = validation;
+    throw err;
+  }
+  
+  // Create import session for tracking and rollback capability
+  const importSession = await createImportSession({
+    sourceFile,
+    propertyId,
+    propertyName,
+    reportType: scanResult.type,
+  });
+  
+  try {
+    const [result] = await runInTransaction([async () => {
+      return await doImport(scanResult, { ...restMeta, forceImport, sourceFile, propertyId, propertyName }, importSession.importId);
+    }]);
+    
+    // Track row counts per table for potential rollback
+    const rowCounts = {};
+    if (scanResult.type === "clerk") {
+      rowCounts["ClerkShiftRecord"] = result.count;
+    } else if (scanResult.type === "adjustments_refunds") {
+      rowCounts["AdjustmentRefund"] = result.count;
+    } else if (scanResult.type === "timecard") {
+      rowCounts["TimecardPunch"] = result.count;
+    } else if (ENTITY[scanResult.type]) {
+      rowCounts[ENTITY[scanResult.type]] = result.count;
+    }
+    
+    await completeImportSession(importSession.importId, rowCounts);
+    // The anomaly alerts were persisted inside the import transaction; their
+    // HMAC audit-log entry is written here, after commit, so the log only ever
+    // records detections that actually stuck. audit.log swallows its own errors,
+    // so a failed log write cannot turn a successful import into a failure.
+    if (result.anomalyAudit) {
+      await db.audit.log({
+        action: "Anomaly Detection",
+        username: "system",
+        performed_by: "system",
+        property_id: result.anomalyAudit.propertyId,
+        property_name: result.anomalyAudit.propertyName || "",
+        result: "success",
+        detail: `Flagged ${result.anomalyAudit.count} financial anomaly alert(s) during import ${importSession.importId} (${result.anomalyAudit.types.join(", ")})`,
+      });
+      if (db.integrations && db.integrations.Email) {
+        await db.integrations.Email.SendEmail({
+          to: "alerts@hotel-operator.com",
+          subject: `[ALERT] ${result.anomalyAudit.count} Financial Anomalies Detected`,
+          body: `During the import of file ${importSession.importId}, ${result.anomalyAudit.count} anomalies were detected.\nTypes: ${result.anomalyAudit.types.join(", ")}\nProperty ID: ${result.anomalyAudit.propertyId}\nProperty Name: ${result.anomalyAudit.propertyName || "Unknown"}\n\nPlease review the Anomaly report in your dashboard immediately.`,
+        }).catch(e => console.error('Failed to send anomaly email', e));
+      }
+    }
+    // Return the session's importId, not the caller's. Callers pass their own
+    // meta.importId for row tagging, but the rollback ledger is keyed by the
+    // session id — a caller that recorded its own would look up an import that
+    // has no ledger and be told it cannot be undone.
+    return { ...result, importId: importSession.importId };
+  } catch (e) {
+    // Attach the SESSION id to the error. Callers mint their own `meta.importId`
+    // for their queue bookkeeping, but the rollback ledger is keyed by the id
+    // that createImportSession minted here — a caller rolling back with its own
+    // id looks up an import that has no ledger and is told, wrongly, that the
+    // undo is impossible. Surfacing the real id is the only way the caller can
+    // clean up. Non-enumerable so the id never leaks into a serialised error.
+    if (importSession?.importId) {
+      Object.defineProperty(e, 'importId', {
+        value: importSession.importId,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+      // Mark the session failed so it is not left indistinguishable from an
+      // import that is still running, and so rollback can tell an atomic
+      // no-rows-committed failure from rows it can no longer identify.
+      await failImportSession(importSession.importId, e?.message).catch(() => {});
+    }
+    throw e;
+  }
+}
+
+async function doImport(scanResult, meta, importId) {
+  const { type } = scanResult;
+  const { forceImport = false, ...restMeta } = meta;
+  const addMetaFn = (obj) => addMeta(obj, { ...restMeta, type, importId });
+
+  if (type === "clerk") {
+    const all = [];
+    for (const p of (scanResult.payments || [])) all.push(addMetaFn(p));
+    for (const d of (scanResult.drops || [])) all.push(addMetaFn(d));
+    for (const c of (scanResult.clerkPayments || [])) all.push(addMetaFn(c));
+
+    const keyFn = (r) => {
+      if (r.record_type === "payment") return `payment|${r.payment_type}|${r._sectionKey || 'unknown'}`;
+      if (r.record_type === "drop") return `drop|${r.shift_date}|${r.clerk_name}|${r.amount}`;
+      return `clerk_payment|${r.clerk_name}|${r.payment_type}|${r.amount}|${r._sectionKey || 'unknown'}`;
+    };
+
+    const deduped = dedupByKey(all, keyFn);
+    const existing = restMeta.propertyId
+      ? await db.entities.ClerkShiftRecord.filter({ property_id: restMeta.propertyId })
+      : [];
+    const seen = new Set(existing.map(keyFn));
+    const newRows = forceImport ? deduped : deduped.filter((r) => !seen.has(keyFn(r)));
+
+    let createdIds = [];
+    if (newRows.length) {
+      for (let i = 0; i < newRows.length; i += 400) {
+        const batch = newRows.slice(i, i + 400);
+        const created = await db.entities.ClerkShiftRecord.bulkCreate(batch);
+        createdIds.push(...created.map((r) => r.id));
+      }
+    }
+    if (createdIds.length) {
+      await recordCreatedIds("ClerkShiftRecord", restMeta.propertyId, importId, createdIds);
+    }
+    const cleaned = await dedupePropertyRows("ClerkShiftRecord", restMeta.propertyId, keyFn);
+    return { count: newRows.length, excluded: deduped.length - newRows.length, cleaned };
+  }
+
+  // ─── Adjustments & Refunds Activity ───
+  if (type === "adjustments_refunds") {
+    const adjustments = (scanResult.adjustments || []).map(addMetaFn);
+    const refunds = (scanResult.refunds || []).map(addMetaFn);
+    const all = [...adjustments, ...refunds];
+
+    const keyFn = (r) => [
+      r.record_type || "adj",
+      r.date || "",
+      r.time || "",
+      r.username || "",
+      r.roomNumber || "",
+      r.transactionNumber || "",
+      r.adjustedAmount ?? r.amount ?? 0,
+    ].join("|");
+
+    const deduped = dedupByKey(all, keyFn);
+    const existing = restMeta.propertyId
+      ? await db.entities.AdjustmentRefund.filter({ property_id: restMeta.propertyId })
+      : [];
+    const seen = new Set(existing.map(keyFn));
+    const newRows = forceImport ? deduped : deduped.filter((r) => !seen.has(keyFn(r)));
+
+    let createdIds = [];
+    if (newRows.length) {
+      for (let i = 0; i < newRows.length; i += 400) {
+        const batch = newRows.slice(i, i + 400);
+        const created = await db.entities.AdjustmentRefund.bulkCreate(batch);
+        createdIds.push(...created.map((r) => r.id));
+      }
+    }
+    if (createdIds.length) {
+      await recordCreatedIds("AdjustmentRefund", restMeta.propertyId, importId, createdIds);
+    }
+
+    // Run clerk-specific anomaly detection on imported adjustments/refunds
+    const stampAnomalySource = row => ({
+      ...row,
+      property_id: restMeta.propertyId ?? "",
+      property_name: restMeta.propertyName || "",
+    });
+    const anomalyInput = {
+      adjustments: adjustments.map(stampAnomalySource),
+      refunds: refunds.map(stampAnomalySource),
+    };
+    const { flaggedAnomalies } = detectClerkAnomalies(anomalyInput);
+    let anomalyAudit = null;
+    if (flaggedAnomalies.length) {
+      const alertRows = flaggedAnomalies.map((a) => ({
+        ...a,
+        alert_type: a.ruleId,
+        severity: a.severity.toLowerCase(),
+        property_id: restMeta.propertyId || "",
+        property_name: restMeta.propertyName || "",
+        import_id: importId,
+        source_file: restMeta.sourceFile || "",
+        status: "open",
+        dedupe_key: a.id,
+      }));
+      const existingAlerts = restMeta.propertyId
+        ? await db.entities.AnomalyAlert.filter({ property_id: restMeta.propertyId })
+        : [];
+      const seenAlerts = new Set(existingAlerts.map((a) => a.dedupe_key));
+      const freshAlerts = alertRows.filter((a) => !seenAlerts.has(a.dedupe_key));
+      let alertIds = [];
+      if (freshAlerts.length) {
+        for (let i = 0; i < freshAlerts.length; i += 400) {
+          const batch = freshAlerts.slice(i, i + 400);
+          const created = await db.entities.AnomalyAlert.bulkCreate(batch);
+          alertIds.push(...created.map((r) => r.id));
+        }
+      }
+      if (alertIds.length) {
+        await recordCreatedIds("AnomalyAlert", restMeta.propertyId, importId, alertIds);
+      }
+      const types = [...new Set(freshAlerts.map((a) => a.alert_type))].sort();
+      anomalyAudit = alertIds.length
+        ? { propertyId: restMeta.propertyId, propertyName: restMeta.propertyName || "", importId, count: alertIds.length, types }
+        : null;
+    }
+
+    const cleaned = await dedupePropertyRows("AdjustmentRefund", restMeta.propertyId, keyFn);
+    return {
+      count: newRows.length,
+      excluded: deduped.length - newRows.length,
+      cleaned,
+      anomalies: flaggedAnomalies.length,
+      anomalyAudit,
+    };
+  }
+
+  // ─── Timecard (Clock In/Out) ───
+  if (type === "timecard") {
+    const punches = (scanResult.rowsToImport || []).map(addMetaFn);
+
+    const keyFn = (r) => [
+      r.employee_name || "",
+      r.shift_date || "",
+      r.clock_in || "",
+      r.clock_out || "",
+    ].join("|");
+
+    const deduped = dedupByKey(punches, keyFn);
+    const existing = restMeta.propertyId
+      ? await db.entities.TimecardPunch.filter({ property_id: restMeta.propertyId })
+      : [];
+    const seen = new Set(existing.map(keyFn));
+    const newRows = forceImport ? deduped : deduped.filter((r) => !seen.has(keyFn(r)));
+
+    let createdIds = [];
+    if (newRows.length) {
+      for (let i = 0; i < newRows.length; i += 400) {
+        const batch = newRows.slice(i, i + 400);
+        const created = await db.entities.TimecardPunch.bulkCreate(batch);
+        createdIds.push(...created.map((r) => r.id));
+      }
+    }
+    if (createdIds.length) {
+      await recordCreatedIds("TimecardPunch", restMeta.propertyId, importId, createdIds);
+    }
+
+    // Flag impossible/likely-error shifts so payroll review sees them immediately.
+    const flagged = [];
+    for (const p of newRows) {
+      const n = normalisePunch(p);
+      if (!n || !n.flags?.length) continue;
+      for (const flag of n.flags) {
+        flagged.push({
+          id: `timecard_${flag}`,
+          severity: "high",
+          title: `Timecard flag: ${flag.replace(/_/g, " ")}`,
+          message: `${n.employeeName || "Unknown employee"} shift on ${n.date || p.shift_date || ""} (${p.clock_in || ""} - ${p.clock_out || ""})`,
+          dedupe_key: `timecard_${flag}|${n.employeeName || ""}|${n.date || ""}`,
+          property_id: restMeta.propertyId || "",
+          property_name: restMeta.propertyName || "",
+        });
+      }
+    }
+    let anomalyAudit = null;
+    if (flagged.length) {
+      const alertRows = flagged.map((a) => ({
+        ...a,
+        alert_type: a.id,
+        import_id: importId,
+        source_file: restMeta.sourceFile || "",
+        status: "open",
+      }));
+      const existingAlerts = restMeta.propertyId
+        ? await db.entities.AnomalyAlert.filter({ property_id: restMeta.propertyId })
+        : [];
+      const seenAlerts = new Set(existingAlerts.map((a) => a.dedupe_key));
+      const freshAlerts = alertRows.filter((a) => !seenAlerts.has(a.dedupe_key));
+      let alertIds = [];
+      if (freshAlerts.length) {
+        for (let i = 0; i < freshAlerts.length; i += 400) {
+          const batch = freshAlerts.slice(i, i + 400);
+          const created = await db.entities.AnomalyAlert.bulkCreate(batch);
+          alertIds.push(...created.map((r) => r.id));
+        }
+      }
+      if (alertIds.length) {
+        await recordCreatedIds("AnomalyAlert", restMeta.propertyId, importId, alertIds);
+      }
+      const types = [...new Set(freshAlerts.map((a) => a.alert_type))].sort();
+      anomalyAudit = alertIds.length
+        ? { propertyId: restMeta.propertyId, propertyName: restMeta.propertyName || "", importId, count: alertIds.length, types }
+        : null;
+    }
+
+    const cleaned = await dedupePropertyRows("TimecardPunch", restMeta.propertyId, keyFn);
+    return {
+      count: newRows.length,
+      excluded: deduped.length - newRows.length,
+      cleaned,
+      anomalies: flagged.length,
+      anomalyAudit,
+    };
+  }
+
+  if (type === "hotel_statistics") {
+    const metrics = scanResult.metrics || scanResult.rowsToImport || [];
+
+    const keyFn = (r) => `${r.property_id}|${r.business_date}|${r.section}|${r.metric_name}|${r.period}|${r.import_id}`;
+
+    const deduped = dedupByKey(metrics, keyFn);
+
+    // File-level guard: same bytes, same property = already imported.
+    //
+    // This used to also match on business_date, which worked only because the
+    // date was permanently "" — every statistics file agreed with every other.
+    // Now that a real date is derived per import, keeping it in the key would
+    // mean re-importing the same file tomorrow derives a different date, misses
+    // the guard, and duplicates all 510 metrics. The file hash already identifies
+    // the snapshot uniquely (a statistics export whose every figure across five
+    // periods is byte-identical to another day's is not a thing), so hash plus
+    // property is both narrower and safer. Same shape the transactions branch uses.
+    const fileHash = scanResult.fileHash;
+    let newRows = deduped;
+    if (fileHash && !forceImport) {
+      const existingImports = await db.entities.HotelMetric
+        .filter({ file_hash: fileHash, property_id: restMeta.propertyId });
+      if (existingImports.length > 0) {
+        newRows = [];
+      }
+    }
+    
+    let createdIds = [];
+    if (newRows.length) {
+      for (let i = 0; i < newRows.length; i += 400) {
+        const batch = newRows.slice(i, i + 400);
+        const created = await db.entities.HotelMetric.bulkCreate(batch);
+        createdIds.push(...created.map((r) => r.id));
+      }
+    }
+    if (createdIds.length) {
+      await recordCreatedIds("HotelMetric", restMeta.propertyId, importId, createdIds);
+    }
+    return { count: newRows.length, excluded: deduped.length - newRows.length, cleaned: 0 };
+  }
+
+  if (type === "transactions") {
+    // Stamp property/import metadata first, then assign dedupe keys — the key
+    // includes property_id, so the order matters.
+    const rows = assignDedupeKeys((scanResult.rowsToImport || []).map((r) => addMetaFn(r)));
+
+    // Two guards, cheapest first.
+    //
+    // 1. File-level: the same file re-imported for the same property is a no-op.
+    //    This is the common case (a user clicking Import twice) and costs one
+    //    indexed lookup instead of reading 17k rows.
+    // 2. Row-level: a partial overlap — e.g. a re-export covering an extra week —
+    //    is filtered by dedupe_key so the new days import and the old ones do not
+    //    duplicate.
+    //
+    // Neither guard ever deletes: an existing row always wins over an incoming
+    // copy of itself.
+    const fileHash = scanResult.fileHash || meta.fileHash || "";
+    if (fileHash && !forceImport) {
+      const priorFile = await db.entities.TransactionLine.filter({
+        file_hash: fileHash,
+        property_id: restMeta.propertyId || "",
+      });
+      if (priorFile.length) {
+        return { count: 0, excluded: rows.length, cleaned: 0, reason: "already-imported" };
+      }
+    }
+    if (fileHash) for (const r of rows) r.file_hash = fileHash;
+
+    let newRows = rows;
+    if (!forceImport) {
+      // The whole property ledger used to be materialized here just to build a
+      // Set of dedupe_keys — a 100k-row read to answer "have I seen these ≤17k
+      // rows before". existingTxnDedupeKeys narrows that to the incoming date
+      // window over the [property_id+date] index (see its definition for why that
+      // is lossless), so the read is bounded by the import size, not the ledger's
+      // history. Selection is byte-identical: `seen` still decides every row.
+      const seen = await existingTxnDedupeKeys(db.entities.TransactionLine, restMeta.propertyId, rows);
+      newRows = rows.filter((r) => !seen.has(r.dedupe_key));
+    }
+
+    const createdIds = [];
+    for (let i = 0; i < newRows.length; i += 400) {
+      const batch = newRows.slice(i, i + 400);
+      const created = await db.entities.TransactionLine.bulkCreate(batch);
+      createdIds.push(...created.map((r) => r.id));
+    }
+    if (createdIds.length) {
+      await recordCreatedIds("TransactionLine", restMeta.propertyId, importId, createdIds);
+    }
+    // Automated anomaly & fraud detection: scan the newly imported ledger rows
+    // and persist flagged alerts for owner review. Runs after the rows are
+    // committed so the import transaction owns both sides consistently.
+    const anomalyResult = await persistAnomalyAlerts(newRows, {
+      ...restMeta,
+      importId,
+      propertyId: restMeta.propertyId,
+      propertyName: restMeta.propertyName,
+      sourceFile: restMeta.sourceFile,
+    });
+    // No dedupePropertyRows pass here: dedupe_key is exact and already applied
+    // above, so a second full-table scan would cost a 17k-row read to find
+    // nothing. Byte-identical rows in this export are legitimate (one posting
+    // action per night of a stay) and the occurrence index in the key keeps
+    // them — a key-collapsing cleanup would silently delete real revenue.
+    return {
+      count: newRows.length,
+      excluded: rows.length - newRows.length,
+      cleaned: 0,
+      anomalies: anomalyResult.count,
+      anomalyAudit: anomalyResult.audit,
+    };
+  }
+
+  if (type === "generic") {
+    return { count: scanResult.rowsToImport?.length || 0, excluded: 0 };
+  }
+
+  // Occupancy, Source, Gross
+  const keyFn = type === "source"
+    ? (r) => `${r.property_id}|${r.date}|${r.code || r.source}`
+    : (r) => `${r.property_id}|${r.date}`;
+
+  const rows = (scanResult.rowsToImport || []).map((r) => addMetaFn(r));
+  const deduped = dedupByKey(rows, keyFn);
+  const newRows = forceImport ? deduped : await skipExisting(ENTITY[type], deduped, keyFn, restMeta.propertyId);
+
+  let createdIds = [];
+  for (let i = 0; i < newRows.length; i += 400) {
+    const batch = newRows.slice(i, i + 400);
+    const created = await db.entities[ENTITY[type]].bulkCreate(batch);
+    createdIds.push(...created.map((r) => r.id));
+  }
+  if (createdIds.length) {
+    await recordCreatedIds(ENTITY[type], restMeta.propertyId, importId, createdIds);
+  }
+  const cleaned = await dedupePropertyRows(ENTITY[type], restMeta.propertyId, keyFn);
+  return { count: newRows.length, excluded: deduped.length - newRows.length, cleaned };
+}
+
+// Rollback an import by deleting exactly the records it created.
+//
+// Re-export, not a reimplementation. There were briefly two rollback functions
+// with the same purpose and different behaviour — this one deleted through the
+// entity proxy, the other through the raw Dexie table, so whether a rollback
+// enforced property isolation and refreshed cached KPIs depended on which one
+// the caller happened to import. Keeping the name as an alias preserves the
+// existing import sites without reintroducing the fork.
+export { rollbackImportSession as rollbackImport } from '@/api/base44Client';
+
+// Backward-compatible convenience: scan + import in one call
+export async function parseReport(type, fileUrl, meta = {}) {
+  const scan = await scanReport(type, fileUrl, meta);
+  const result = await importReport(scan, meta);
+  return { ...result, scan };
+}// SENTINEL123

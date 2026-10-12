@@ -1,0 +1,115 @@
+{
+  "name": "UploadedReport",
+  "type": "object",
+  "properties": {
+    "property_id": {
+      "type": "string"
+    },
+    "property_name": {
+      "type": "string"
+    },
+    "report_type": {
+      "type": "string"
+    },
+    "import_id": {
+      "type": "string"
+    },
+    "source_file": {
+      "type": "string"
+    },
+    "drive_file_id": {
+      "type": "string"
+    },
+    "drive_backup_status": {
+      "type": "string"
+    },
+    "file_name": {
+      "type": "string"
+    },
+    "rows_imported": {
+      "type": "number"
+    },
+    "rows_skipped": {
+      "type": "number"
+    },
+    "rows_parsed": {
+      "type": "number"
+    },
+    "file_url": {
+      "type": "string"
+    },
+    "columns": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "raw_rows": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "required": [
+    "file_name"
+  ],
+  "rls": {
+    "read": {
+      "$and": [
+        {
+          "user_condition": {
+            "is_active": true
+          }
+        },
+        {
+          "$or": [
+            {
+              "user_condition": {
+                "role": "admin"
+              }
+            },
+            {
+              "user_condition": {
+                "role": "owner"
+              }
+            },
+            {
+              "data.property_id": {
+                "$in": "{{user.property_access}}"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "write": {
+      "$and": [
+        {
+          "user_condition": {
+            "is_active": true
+          }
+        },
+        {
+          "$or": [
+            {
+              "user_condition": {
+                "role": "admin"
+              }
+            },
+            {
+              "user_condition": {
+                "role": "owner"
+              }
+            },
+            {
+              "data.property_id": {
+                "$in": "{{user.property_access}}"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

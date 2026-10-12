@@ -1,0 +1,929 @@
+# 4. ALL 34 PAGES (What Users See)
+
+## Startup payload (October 2026)
+
+The startup branch incorporates main's parallel page prefetch and cached startup
+hydration. These compose with lazy Layout and the on-demand command dialog.
+The integration was reviewed without additional tests at the owner's request.
+
+`src/App.jsx` loads the authenticated `Layout` through its existing suspense
+fallback. The unused root Yjs provider is removed; the lazy `DemoYDoc` page keeps
+its own provider and document. `CommandMenu` retains only shortcut/open state at
+startup and imports `CommandMenuDialog` when Ctrl/Cmd+K opens it. Closing restores
+focus, and reopening retries a failed dialog load. Authentication and authoritative
+data hydration gates retain their existing behavior.
+
+The completed intermediate build reduced the transitive initial JavaScript from
+1,231,657 to 936,210 bytes (gzip: 391,321 to 298,816) after the App changes alone.
+The final command-menu split has not been built or tested: the owner requested
+that Antigravity perform the follow-up testing.
+
+## Owner Analyst: grounded financial answers
+
+`src/components/AIAssistant.jsx` is an owner-facing analyst surface in the
+standalone deployment. It calls the local `answerQuestion` path; it must never
+claim that an external AI model inspected the data. The assistant can explain
+revenue, occupancy, ADR, RevPAR, payments, refunds, expenses, payroll, channels
+and clerk variance from imported records only.
+
+For questions such as “why Monday money low Friday high?”,
+`src/lib/ownerAnalysis.js` computes a deterministic weekday comparison before
+the response is rendered. It shows average matching business days, rooms sold,
+occupancy, ADR, channel contribution and available refund evidence. A channel
+revenue change is a fact; rate parity, inventory, cancellations and local demand
+are **verification questions**, never asserted causes unless corresponding data
+exists. The standard response order is: direct answer, numbers, proven drivers,
+what still needs verification, GM questions, and data-quality statement.
+
+Small spelling mistakes are corrected only against a narrow hotel vocabulary
+(for example `mony` → `money`, `fridy` → `friday`). Do not fuzzy-correct dates,
+dollar amounts, or property names. The UI exposes the interpretation/correction
+so an owner can catch a misunderstanding. Regression coverage lives in
+`src/lib/ownerAnalysis.test.js`.
+
+Every page in the app, what it does, and what files it depends on. The count is the
+number of rows below, verified against `src/pages/*.jsx` (excluding `*.test.jsx`):
+34 on disk, 34 documented, no drift in either direction. This heading read "36" until
+2026-08-25 while the table below listed 34 — the table was right.
+
+### Main Dashboard
+| Page | File | What It Does | Key Dependencies |
+|------|------|-------------|-----------------|
+| **Dashboard** | `src/pages/Dashboard.jsx` | Main scoreboard: revenue, occupancy, profit, charts | `MoneyKept`, `PaymentMethodChart`, `RevenueTrend`, `PropertyRanking`, `OtaMatrix`, `ExecutiveCharts`, `LowOccAlert`, `WeatherPanel`, `YieldAdvisor`, `PricingPanel` |
+| **Statistics** | `src/pages/Statistics.jsx` | Detailed stats with filters, MTD, YTD comparisons | `statisticsAnalytics.js`, `MetricExplorer`, `useHotelData.js` |
+| **Compare** | `src/pages/Compare.jsx` | Side-by-side property and period comparison | `CompareBars`, `CompareCard`, `ChannelRevenue` |
+| **MtdGrowth** | `src/pages/MtdGrowth.jsx` | Month-to-date growth velocity tracking | `calculationService.js` |
+| **Forecasting** | `src/pages/Forecasting.jsx` | Predict future revenue (1, 7, 30, 90 day) | `forecasting.js` |
+
+### Operations
+| Page | File | What It Does | Key Dependencies |
+|------|------|-------------|-----------------|
+| **Import** | `src/pages/Import.jsx` | Upload CSV files from HotelKey, auto-classify, batch import, queue recovery, atomic undo | `csvParser.js`, `universalParser.js`, `parser.worker.js`, `importValidation.js`, `reportParsers.js`, `rateLimiters.js`, `importQueueHelpers.js` |
+| **ManualEntry** | `src/pages/ManualEntry.jsx` | Enter data by hand, copy-paste from spreadsheets | `manualEntryImport.js`, `manualEntrySave.js`, `manualDraft.js` |
+| **Housekeeping** | `src/pages/Housekeeping.jsx` | Room status board (clean/dirty/inspected), maid assignment | `housekeepingService.js`, `housekeepingConfig.js`, `laborOptimization.js` |
+| **RoomBoard** | `src/pages/RoomBoard.jsx` | Visual room grid: check-in/out, live cache invalidation | `roomBoard.js`, `pricingEngine.js`, `pricingSettings.js`, `realtime.js` |
+| **MonthlyCalendar** | `src/pages/MonthlyCalendar.jsx` | Heatmap calendar: daily occupancy + revenue tiers | `calendarGrids.js`, `revenueThresholds.js`, `hotel.js` |
+
+### Finance
+| Page | File | What It Does | Key Dependencies |
+|------|------|-------------|-----------------|
+| **Transactions** | `src/pages/Transactions.jsx` | Detailed guest transaction ledger | `transactionAnalytics.js`, `transactionNorm.js` |
+| **Payments** | `src/pages/Payments.jsx` | Payment method breakdown (card/cash/check) | `paymentNorm.js`, `taxConfig.js`, `reconciliationExport.js` |
+| **Expenses** | `src/pages/Expenses.jsx` | Operating expense tracking, P&L rollup | `expenseCategories.js`, `deleteGuard.js` |
+| **OtaChannels** | `src/pages/OtaChannels.jsx` | OTA performance: net margin by channel | `commissionRates.js`, `pdfExport.js` |
+| **ChannelManager** | `src/pages/ChannelManager.jsx` | Channel commission configuration | `commissionRates.js` |
+
+### Staff & Payroll
+| Page | File | What It Does | Key Dependencies |
+|------|------|-------------|-----------------|
+| **Employees** | `src/pages/Employees.jsx` | Staff roster, clerk cash variance audit, anomaly sign-off | `anomalyDetector.js`, `anomalySignoff.js`, `ClerkAuditMatrix` |
+| **Payroll** | `src/pages/Payroll.jsx` | Payroll register: hourly/salary, overtime, compensation, realtime invalidation | `payrollCalc.js`, `timecardCalc.js`, `employeeId.js`, `deleteGuard.js`, `realtime.js` |
+
+### Analytics & Intelligence
+| Page | File | What It Does | Key Dependencies |
+|------|------|-------------|-----------------|
+| **DataIntelligence** | `src/pages/DataIntelligence.jsx` | CSV health scoring, cross-report consistency, AI diagnostics | `dataScanner.js`, `aiInsights.js` |
+| **DataTemplate** | `src/pages/DataTemplate.jsx` | CSV template reference + sample generator | None |
+| **ChartBuilder** | `src/pages/ChartBuilder.jsx` | Custom chart creator (grouping, aggregation, multi-chart) | `chartExport.js`, `UniversalChart` |
+| **Pricing** | `src/pages/Pricing.jsx` | Dynamic pricing recommendations + overrides | `pricingEngine.js`, `pricingOverride.js`, `pricingSettings.js` |
+| **ActionCenter** | `src/pages/ActionCenter.jsx` | Automated alerts: Fix Today / Investigate / Opportunity, plus the next 5 event days | `actionCenter.js`, `eventSchedule.js`, `hotel.js`, `useHotelData.js` |
+| **Reviews** | `src/pages/Reviews.jsx` | Guest review sentiment scoring + reputation | `reputationService.js` |
+
+### Admin & Security
+| Page | File | What It Does | Key Dependencies |
+|------|------|-------------|-----------------|
+| **Login** | `src/pages/Login.jsx` PROTECTED | Sign in with MFA, remember-me | `AuthContext.jsx`, `security.js`, `MFASetup` |
+| **Setup** | `src/pages/Setup.jsx` PROTECTED | First-run owner creation wizard | `AuthContext.jsx`, `security.js`, `validator.js` |
+| **ForgotPassword** | `src/pages/ForgotPassword.jsx` PROTECTED | Request password reset (anti-enumeration) | `securityUtils.js`, `validator.js` |
+| **ResetPassword** | `src/pages/ResetPassword.jsx` PROTECTED | Execute password reset (token + complexity) | `security.js`, `securityUtils.js` |
+| **ChangePassword** | `src/pages/ChangePassword.jsx` | Change own password with strength check | `security.js`, `securityUtils.js`, `AuthContext.jsx` |
+| **Users** | `src/pages/Users.jsx` | User management: invitations, roles, lockouts, MFA | `permissions.js`, `security.js` |
+| **AuditLog** | `src/pages/AuditLog.jsx` | Security audit log viewer + chain verification | `securityUtils.js`, `auditFilter.js` |
+| **Settings** | `src/pages/Settings.jsx` | App settings: properties (active toggle, edit modal, atomic delete), commissions, alerts, taxes, MFA, backup/restore, **delete account** | `commissionRates.js`, `alertThresholds.js`, `taxSettings.js`, `dbArchive.js`, `AuthContext.jsx` (`logout`), `localDb.js` |
+| **PrivacyPolicy** | `src/pages/PrivacyPolicy.jsx` | Legal page | None |
+| **TermsOfService** | `src/pages/TermsOfService.jsx` | Legal page | None |
+| **DemoYDoc** | `src/pages/DemoYDoc.jsx` | Real-time CRDT sync demo | `crdt.jsx` |
+
+---
+
+## 18. Owner Analyst — evidence-only owner questions
+
+Owner Analyst corrects only a narrow set of hotel-operational spelling mistakes; property names, dates, and amounts are never fuzzy-corrected. Weekday explanations show imported occupancy, revenue, ADR, channel, and refund facts, while operational causes remain verification tasks. “Why is money kept down?” compares the requested period with the immediately preceding equal-length period and decomposes the change into revenue, refunds, payroll, and operating costs. “What is wrong today?” gives an owner briefing from the latest imported business day and its preceding-day baseline. Missing baselines, channel reports, or operational records are stated as limits, never filled with a guess.
+
+Comparable ranges are calculated from explicit date-time millisecond values, so the same date logic is valid under the browser runtime and the repository’s strict JavaScript typecheck.
+
+The in-panel conversation can carry the last confirmed property, date range, and operational topic into a short follow-up such as “why was it low?” or “what about Expedia?”. Topics are deliberately limited to revenue/money kept, occupancy, channels, refunds, costs, cash, and a daily summary. The active context is shown and can be cleared. A new explicit date overrides it, a dashboard-filter change clears it, and the context is only a client-side default: authorization always remains session-derived in the function layer. Topic-aware answers compare the preceding equal-length period when its imported report exists; otherwise they state the missing evidence rather than infer a cause.
+
+## 19. Clerk Audit — refund evidence and room-rent leakage
+
+The Clerk Audit classifies AdjustmentRefund records from evidence, not a dollar shortcut. A note that explicitly identifies a guest/security/incidental deposit return is a proved **Deposit Return** and is excluded from room-rent leakage. A non-deposit refund is surfaced as a **Room-Rent Refund** (or possible room-rent refund when the note lacks a service/rate reason). An exact `$100` refund with no deposit-return wording is **Needs Review**—it is neither silently excluded nor accused as leakage. Cash room-rent refunds receive the strongest visual emphasis because they need prompt folio and approval review. The audit identifies the clerk who processed an entry; it never attributes the operational cause to that clerk without supporting evidence.
+
+Inside a selected clerk’s drawer, the owner can independently filter folio refunds by classification (including cash room-rent risk), payment method, date range, room number, evidence/notes, and inclusive minimum/maximum amount. The live result count and total always reflect every active filter. “Hide proved deposit returns” excludes only note-confirmed deposits; it never hides unclear `$100` items. Clear filters restores the complete selected-clerk ledger.
+
+# 5. ALL 90+ LIBRARIES (The Engines Under The Hood)
+
+These are the files in `src/lib/` -- the brains of the app. Grouped by what they do.
+
+### Money & Financial Engines
+| File | What It Does | If You Edit This... |
+|------|-------------|-------------------|
+| `calculationService.js` | **Main calculator**: ADR, RevPAR, occupancy, net revenue, weighted averages | Dashboard numbers change. Test ALL financial displays. |
+| `dailyAggregates.js` | Builds daily summary rows from raw data, caches results | Dashboard cards break. The room_revenue typo lived here (Problem #3). |
+| `financialReconciliation.js` | 4-way cross-check: PMS reports, gateway auth, batch settlement, bank deposits | Nothing on screen changes — no page imports it (measured 2026-08-24: `hotelKeyRegression.test.js` + `probe-financial-invariant.mjs` only). Drift is a `console.warn`, not an alert. |
+| `RevenueReconciliation.js` | 3-path revenue matcher (Path 1 vs 2 vs 3) | Revenue audit breaks. |
+| `decimal.js` | Integer-cents math: toCents(), fromCents(), multiply(), divide() -- prevents float errors | ALL money calculations break. Critical for accuracy. `Math.round(n * SCALE)` inside it is not a violation — that IS the dollars-to-cents boundary. Importing this module opts a file into the cents domain, and `scripts/probe-float-money.mjs` then forbids float-dollar rounding in it unless the site is allowlisted with a reason. Measured 2026-08-24: 26 modules have opted in. |
+| `settingsStore.js` | The ONLY localStorage reader/writer the settings modules may use. Readers return the caller's fallback and log the key they discarded; writers return `true`/`false` and never throw. **Measured 2026-08-25: 9 importers — 8 settings modules plus `DataIntelligence.jsx` — and 12 key names, one of which (`rri_housekeeping_config_`) is a per-property prefix rather than a fixed key.** The earlier figure of "7 modules, 9 keys" was correct on 2026-08-24 and went stale twice: `DataIntelligence.jsx` (+2 keys) joined with the catch-block sweep, and `housekeepingConfig.js` (+1) with tracker #55. | A refused write becomes silent again. Before 2026-08-24 those modules carried hand-written `catch {}` blocks between them, so a quota-exhausted or private-browsing write was swallowed while `notifySettingsChanged()` still fired — the page showed "Saved" and the app kept computing on the OLD rate (measured: 22% typed, 15% applied = $70 unreported per $1,000 of Expedia gross). **Never `void` a writer's return value.** And a boolean is only half of it: where the store *clamps*, read the value back before rendering it — see `housekeepingConfig.js` below. **Not every silent-storage fix belongs here:** `manualDraft.js` (2026-08-25) was written separately because a draft's failures have to reach the screen and it needs a guarded remove — see that row. |
+| `commissionRates.js` | OTA commission models (fixed, %, none, tax-exempt) | Channel revenue goes wrong. Its setters return `false` when the browser refuses the write — a caller that ignores that shows a rate the engine is not using. `commissionFor()` resolves the LONGEST matching key, so editing `EXPEDIA` does not move `EXPEDIA HOTEL COLLECT`. **It owns THREE keys** (`rri_commission_rates_v2`, `rri_cc_fee_rate`, `rri_cc_fee_refunds_v1`); a page that hand-lists them will list the wrong number, as `Settings.jsx`'s delete-account handler did with two of three (tracker #57). Nothing outside this module should name its keys. |
+| `expenseCategories.js` | Expense type definitions | Expense tracking breaks. |
+| `taxConfig.js` | Tax configuration rules | Tax calculations go wrong. |
+| `taxSettings.js` | Date-windowed property-specific tax rates | Tax liability miscalculated. |
+| `taxLiability.js` | Tax liability calculator | Tax reports wrong. |
+| `payrollCalc.js` | Payroll: gross-to-net wage computation | Employee pay calculated wrong. |
+| `timecardCalc.js` | Timecard hours/overtime (40h threshold, 30m break rules) | Overtime pay wrong. |
+| `recalculationService.js` | Triggers React Query cache invalidation when data changes | Stale dashboard data. |
+
+### Data Processing & Parsing
+| File | What It Does | If You Edit This... |
+|------|-------------|-------------------|
+| `csvParser.js` | Core CSV parser (handles duplicate columns -- Problem #1 fix) | ALL data imports break. |
+| `universalParser.js` | Multi-grid streaming CSV parser for complex reports | Complex CSV imports fail. |
+| `parser.worker.js` | Web Worker for background CSV parsing (off main thread) | Import page freezes browser. |
+| `reportParsers.js` | Parses specific HotelKey report types (Occupancy, Revenue, etc.) | Reports import with wrong column mapping. |
+| `importValidation.js` | 4-layer validation: structure, columns, data types, business logic | Bad data gets into database. |
+| `dataScanner.js` | Auto-detects CSV format, finds duplicates, date gaps, orphans | Data Intelligence page breaks. |
+| `transactionNorm.js` | Normalizes transaction data shapes | Transaction page shows wrong data. |
+| `paymentNorm.js` | Normalizes payment method names (Visa, MC, etc.) | Payment chart labels wrong. |
+| `hotel.js` | Core hotel data operations and transformations | Everything hotel-related breaks. |
+| `manualEntryImport.js` | Manual data entry processing | Manual Entry page breaks. |
+| `manualDraft.js` | The ONLY holder of the Manual Entry draft key and of every `localStorage` call behind it (`draftKeyFor`, `readDraft`, `writeDraft`, `clearDraft`). **Deliberately not on `settingsStore.js`:** a draft is not a setting — its failures must reach the *screen*, so each message is a finished sentence the page renders through `setSaveMsg`/`setMsgTone`, and it needs a guarded `removeItem`, which the settings store has no primitive for. | Hand-typed money rows are lost in silence again. Before 2026-08-25 the page held 5 raw calls: `getItem` sat outside its own `try`, so a browser that refuses storage threw out of a `useEffect` and `LazyErrorBoundary` **replaced the whole page**; a corrupt draft was deleted with no message; the auto-save's only failure path was `console.warn` while the amber "● Unsaved draft" dot kept claiming the rows were kept; and the unguarded clear after a *successful* save threw past `setSaving(false)` and `rotateCsrfToken()`. `manual_draft_` is also a `LOCAL_SLOT_PREFIXES` entry in `dbArchive.js`, so renaming the key drops drafts out of every backup — `probe-db-archive.mjs` asserts it. See BRAIN_TROUBLESHOOTING section 35. |
+| `uploadRetention.js` | TTL cleanup of expired CSV previews from IndexedDB | Browser storage fills up. |
+
+### Security (Most Are Protected!)
+| File | What It Does | If You Edit This... |
+|------|-------------|-------------------|
+| `AuthContext.jsx` PROTECTED | Auth provider, session management, idle polling (30s), cross-tab logout | Login breaks for EVERYONE. **Its `logout(shouldRedirect = true)` takes a BOOLEAN and builds `/login?returnTo=…` itself. `db.auth.logout(redirect)` in `base44Client.js` takes a URL and assigns it straight to `window.location.href`.** Two same-named functions, one parameter each, and `true` is legal-looking to both — `Settings.jsx` passed `true` to the URL one and sent deleted accounts to `<origin>/true` (tracker #57, BRAIN_TROUBLESHOOTING section 36). Pages should call this one. |
+| `security.js` PROTECTED | PBKDF2 hashing (300k iterations), TOTP/MFA, WebCrypto | Passwords break, MFA breaks. |
+| `securityUtils.js` PROTECTED | CSRF tokens (__Host- prefix), rate limiting, SHA-256 audit chain | Security wide open to attacks. |
+| `permissions.js` PROTECTED | Roles: owner/admin/manager/front_desk/accountant/read_only | Users see data they should not. |
+| `validator.js` PROTECTED | Email/input validation rules | Bad data accepted, injection possible. |
+| `authHelpers.js` | Auth utility functions | Login flow breaks. |
+| `authReturnTo.js` | Remembers where user was before login redirect | User redirected wrong after login. |
+| `deleteGuard.js` | Safe deletion pipeline: Dependent-disclosure -> Confirm -> Rate-Limit -> CSRF check. `dependents` puts the count and money value of the records that will *survive* into the dialog | Accidental mass deletion possible; operator cannot tell what a delete keeps. |
+| `launchPolicy.js` | Production launch restrictions (LAUNCH_POLICY_V1) | Wrong users get production access. |
+| `sessionChannel.js` | Cross-tab session sync via BroadcastChannel | Logout in one tab does not logout others. |
+| `mfaRecovery.js` | MFA recovery code generation + SHA-256 hash validation | Users locked out of MFA accounts forever. |
+| `auditLogger.js` | Frontend audit event logging | Security events not logged. |
+| `auditFilter.js` | Audit log filtering for viewer page | Audit page filters break. |
+
+### Analytics, AI & Intelligence
+| File | What It Does | If You Edit This... |
+|------|-------------|-------------------|
+| `anomalyDetector.js` | Welford's algorithm + Benford's Law + z-score outliers | Fraud detection breaks. |
+| `fraudScoringEngine.js` | Clerk-shift risk scoring: cash-adjustment z-score, rate overrides, off-hours (01:00–05:00) activity over $50. **Two entry points that disagree on weights and cut-offs** — read the module header before wiring either in | Nothing on screen changes — imported only by `hotelKeyRegression.test.js`. There is no fraud alert wired to a page yet. |
+| `statisticsAnalytics.js` | Statistical analysis engine for Statistics page | Statistics page breaks. |
+| `columnarAnalytics.js` | **Unwired scaffold.** Zero importers anywhere; every metric array is built at length 0 with no ingestion path, so it can only ever return zeros | Nothing breaks. Data Intelligence runs on `dataScanner.js` + `aiInsights.js`. Deletion proposed — see the file header. |
+| `transactionAnalytics.js` | Transaction pattern analysis, employee performance | Transaction insights wrong. |
+| `aiEngine.js` | AI prompt builder + intent parser + date resolver | AI Assistant answers wrong. |
+| `aiInsights.js` | AI-generated dashboard insight cards | AI insight cards break. |
+| `agenticAI.js` | **Unwired scaffold.** Zero importers anywhere — `git grep agenticAI` finds it in no code file, only in this doc and `BRAIN_INDEX.md`. 18 lines, one exported function, and a mojibake character in its own header comment | Nothing breaks. Deletion proposed. *Corrected 2026-09-03: this row previously read "Agentic AI orchestration + scheduling proposals / AI workflows break", which would stop a reader from removing dead code.* |
+| `ownerIntelligence.js` | Owner-specific business intelligence metrics | Owner reports wrong. |
+| `forecasting.js` | Multi-model revenue prediction (1/7/30/90 day) | Forecasting page breaks. |
+| `revenueThresholds.js` | Revenue alert thresholds | Revenue alerts stop firing. |
+| `alertEngine.js` | Alert generation engine | All alerts stop. |
+| `alertThresholds.js` | Alert threshold configuration | Alert sensitivity wrong. |
+
+### Operations & Pricing
+| File | What It Does | If You Edit This... |
+|------|-------------|-------------------|
+| `pricingEngine.js` | Dynamic room pricing: elasticity, demand, weather, comp-set | Room prices calculated wrong. |
+| `pricingOverride.js` | Manual price overrides | Override prices do not apply. |
+| `pricingSettings.js` | Pricing sensitivity presets | Pricing defaults wrong. |
+| `housekeepingService.js` | Room status management (clean/dirty/inspected) | Room board wrong. |
+| `housekeepingConfig.js` | Four per-property productivity standards (checkout min, stayover min, wage, target labor %), clamped to `LIMITS` on write | The Housekeeping page's whole labor plan derives from these four numbers. Two rules learned the hard way (tracker #55, BRAIN_TROUBLESHOOTING section 34): **the writer clamps, so a caller must re-read with `getHousekeepingConfig` rather than trust what it submitted** — otherwise the page renders figures computed from a value that was never stored; and **`Number(x) \|\| fallback` is forbidden here**, because the editors report `Number(e.target.value)`, `Number("")` is `0`, and a falsy test made the clamp floors unreachable from the UI. |
+| `roomBoard.js` | Room grid state management | Room board view breaks. |
+| `weatherService.js` | Live weather data + revenue correlation | Weather widget breaks. |
+| `weatherSettings.js` | Property coordinates for the forecast (never an API key — that is server-side) | More than the weather card. Traced 2026-08-24: WeatherPanel fetches with these coordinates and persists `WeatherSnapshot` rows, `usePricing.js` builds `weatherByDate` from those rows, and `pricingEngine.js` turns it into `weatherMultiplierBps` — so wrong coordinates quietly move every recommended rate. |
+| `laborOptimization.js` | `generateHousekeepingSchedule(checkouts, stayovers, standards)` — required minutes and shift count | Until 2026-08-25 it hardcoded `* 30` and `* 15`, **the exact defaults of the two minute settings**, so both were decorative: read, clamped, saved, never consumed. The historical constants are now the parameter's defaults, so a caller passing nothing is unchanged. If you touch it, assert that a *tuned* standard moves `requiredMinutes` — a round-trip assertion cannot see this defect. `MINUTES_PER_SHIFT = 480` is deliberately not configurable. |
+| `yieldOptimizer.js` | Rate recommendation in float dollars. **Unwired**, and it disagrees with the live `pricingEngine.js` by up to $25.60/night on identical inputs | Nothing on screen changes — imported only by `hotelKeyRegression.test.js`. Its file header recommended deleting it and making `YieldAdvisor.jsx` render pricingEngine's number; resolved differently on 2026-08-25 — see `yieldAdvice.js`, which recommends **no** rate at all and points the reader at the Dynamic Pricing panel, so the app keeps exactly one rate recommender. |
+| `reputationService.js` | Guest review aggregation + sentiment | Reviews page breaks. |
+| `actionCenter.js` | Action item management (Fix Today/Investigate/Opportunity) | Action Center page breaks. |
+| `yieldAdvice.js` | `buildYieldAdvice({occupancy, capacity, roomsSold, threshold})` → `{band, target, occupancy, capacity, roomsSold, headline, action, basis}`. The Dashboard yield panel's whole decision, split out of the `.jsx` so `probe-yield-advisor.mjs` can import it (JSX cannot be imported by the harness — same split as `actionCenter.js` ↔ `ActionCenter.jsx`) | The panel's text. Three invariants: it **recommends no rate** (that is `pricingEngine.js`, alone); its soft band is `occ < getOccThreshold()`, which is `LowOccAlert`'s own predicate, so the two panels on one screen cannot contradict each other; and `capacity <= 0` returns `band: 'unknown'` — an unmeasured period must not receive rate advice. `STRONG_OCCUPANCY_MARGIN = 0.20` is the one editorial constant (there is no high-occupancy setting in `alertThresholds.js`); at the default 0.60 target it reproduces the shipped 0.80 boundary. |
+| `anomalySignoff.js` | Anomaly triage sign-off workflow | Anomaly triage breaks. |
+
+### Infrastructure & UI Utilities
+| File | What It Does | If You Edit This... |
+|------|-------------|-------------------|
+| `query-client.js` | React Query config (data fetching cache) | ALL data fetching breaks. |
+| `crdtSync.js` | Hand-rolled LWW-Set / OR-Map / vector clocks. **Not Yjs** (that is `src/crdt.jsx`) and **unwired** — the only importer is `probe-crdt-convergence.mjs` | Nothing breaks. Multi-user editing runs on `src/crdt.jsx` (Yjs), which `App.jsx` wraps the whole app in. Editing this only affects that one probe. |
+| `ySync.js` | Yjs sync utilities | Real-time sync breaks. |
+| `realtime.js` | Real-time data subscription | Live updates stop. |
+| `settingsBus.js` | Settings event bus (BroadcastChannel) | Settings do not propagate across tabs. |
+| `navigation.js` | Route definitions, titles, icons | Sidebar navigation breaks. |
+| `app-params.js` | Global app parameters | App defaults wrong. |
+| `chartExport.js` | Export charts as high-DPI images | Chart export fails. |
+| `pdfExport.js` | Export data as PDF | PDF export fails. |
+| `reconciliationExport.js` | Export reconciliation reports | Reconciliation export fails. |
+| `motion.js` | Framer Motion animation config | Animations break. |
+| `sound.js` | Notification sounds (Web Audio) | Alert sounds stop. |
+| `donutLabelLayout.js` | Pie chart label positioning algorithm | Donut chart labels overlap. |
+| `useCountUp.jsx` | Number count-up animation for KPI cards | KPI animations break. |
+| `ui-utils.js` | **Unwired scaffold.** 134 lines of UI helpers with zero importers in `src/`, and no `scripts/` or `tests/` file reads it as a fixture | Nothing breaks. *Corrected 2026-09-03: previously "UI helper functions / Various UI glitches", which implied live consumers that do not exist.* |
+| `utils.js` | General utility functions | Many things break subtly. |
+| `employeeId.js` | Employee ID generation | Employee IDs wrong. |
+| `uploadRetention.js` | Manages uploaded file cleanup | Old uploads never cleaned up. |
+| `calendarGrids.js` | Decides WHICH months a calendar page draws, from the same `dateRange` the KPIs aggregate. `calendarMonths()`, `monthsInRange()`, `daysInMonth()`, `MAX_GRIDS` | MonthlyCalendar's header, grid count and KPIs stop agreeing. See section 16. |
+| `dbArchive.js` | Whole-database backup and restore across all three storage layers | Owner loses the only off-device copy of the data. See section 7.6. |
+| `sdkAnalyticsOff.js` | Mutates the shared SDK config in place to stop the vendor analytics beacon | The live console fills with `405` on `analytics/track/batch`. |
+
+### Custom Hooks
+| File | What It Does | If You Edit This... |
+|------|-------------|-------------------|
+| `useHotelData.js` | Fetches and caches ALL hotel data | ALL pages lose hotel data. |
+| `useGlobalFilters.jsx` | Global date/property filter state | All filters break across every page. |
+| `usePricing.js` | Pricing data hook | Pricing page loses data. |
+| `usePullToRefresh.js` | Pull-to-refresh gesture on mobile | Mobile refresh gesture breaks. |
+| `useSettingsVersion.js` | Subscribes to settings changes via settingsBus | UI does not recompute when settings change. |
+| `use-mobile.jsx` | Mobile viewport detection (<768px) | Mobile layout breaks. |
+| `use-size.jsx` | Element size tracking (ResizeObserver) | Responsive chart sizing breaks. |
+
+---
+
+# 6. ALL 40+ COMPONENTS (Reusable UI Pieces)
+
+### Dashboard Widgets (src/components/dashboard/)
+| Component | What It Shows | Key Data Source |
+|-----------|-------------|----------------|
+| `MoneyKept.jsx` | Net revenue bridge UI; pure financial/view model in `moneyKeptModel.js` | `dailyAggregates.js` -> `room_revenue` |
+| `PaymentMethodChart.jsx` | Pie chart of payment methods | `PaymentDay` entity |
+| `RevenueTrend.jsx` | Revenue over time line chart | `GrossRevenueDay` entity |
+| `PropertyRanking.jsx` | Properties ranked by revenue | `calculationService.js` |
+| `OtaMatrix.jsx` | OTA channel performance: gross, commission, net margin | `Channel` entity |
+| `ExecutiveCharts.jsx` | Multi-series area/bar: portfolio occupancy and revenue pacing | Multiple sources |
+| `LowOccAlert.jsx` | Low occupancy warning banner | `OccupancyDay` entity |
+| `WeatherPanel.jsx` | Weather forecast + revenue correlation | `getWeather` function |
+| `YieldAdvisor.jsx` | Occupancy band + what to do about it. Renders `yieldAdvice.js` and computes nothing itself. Until 2026-08-25 it computed its advice inline and **every figure in it was invented**: `$10–$15` / `$5–$8` rate moves from nothing, an ADR target from `money2(adr * 1.05)` (float dollars), a caption reading "Occupancy vs 100-room capacity" on a page that holds the real room-night total, a hardcoded `> 0.6` band that contradicted `LowOccAlert` on the same screen, and "Soft Occupancy (0.0%). Drop rate $5–$8" for an **empty** database | `yieldAdvice.js`, `hotel.js` (`pct`, `money2`), `ui-exec/Card` |
+| `PricingPanel.jsx` | Dynamic pricing overview card | `pricingEngine.js` |
+| `ModuleCards.jsx` | Feature module quick access tiles | Navigation config |
+| `ClerkAudit.jsx` | Clerk shift audit view | `ClerkShiftRecord` entity |
+| `ClerkAuditMatrix.jsx` | Clerk cash variance comparison matrix | `ClerkShiftRecord` entity |
+
+### Chart Components (src/components/charts/)
+| Component | What It Does |
+|-----------|-------------|
+| `UniversalChart.jsx` | Renders any chart type (bar, line, area, pie) + high-DPI export |
+| `PieDonut.jsx` | Donut/pie charts with custom label layout |
+| `ChartToolbar.jsx` | Chart filter/export toolbar |
+
+### Layout & Navigation
+| Component | What It Does |
+|-----------|-------------|
+| `Layout.jsx` | Main app shell: sidebar, header, content area, responsive drawer |
+| `GlobalControlBar.jsx` | Persistent top filter bar: property + date range + compare toggles |
+| `ProtectedRoute.jsx` | Route guard: role checks, active status, audit logging |
+| `ScrollToTop.jsx` | Auto-scroll to top on page change |
+| `AuthLayout.jsx` | Layout for login/setup pages |
+| `CommandMenu.jsx` | Cmd+K keyboard search palette |
+| `AIAssistant.jsx` | Slide-out AI chatbot panel |
+| `propertyMap.jsx` | Leaflet-based interactive property map — **UNWIRED (2026-09-03): zero importers.** It is the only consumer of the declared `leaflet`, `react-leaflet` and `@types/leaflet` dependencies, so those three exist solely for a component nothing renders. `vite.config.js` records the same finding in its `manualChunks` comment. |
+
+### Modals & Dialogs
+| Component | What It Does |
+|-----------|-------------|
+| `MFASetup.jsx` | MFA enrollment wizard with TOTP QR code |
+| `MFARecoveryModal.jsx` | MFA backup recovery code display — **UNWIRED (2026-09-03): zero importers** |
+| `PasswordConfirmDialog.jsx` | Step-up password re-verification for sensitive actions |
+| `HousekeepingSettingsModal.jsx` | Housekeeping configuration — **UNWIRED (2026-09-03): zero importers** |
+| `TaxConfigModal.jsx` | Tax rule management |
+| `AnomalySignoffModal.jsx` | Anomaly triage sign-off — **UNWIRED (2026-09-03): zero importers** |
+| `PricingOverrideButton.jsx` | Manual price override trigger — **UNWIRED (2026-09-03): zero importers** |
+| `ReconciliationExportButton.jsx` | Reconciliation report export trigger — **UNWIRED (2026-09-03): zero importers** |
+| `UserNotRegisteredError.jsx` | Error display for unregistered users — **UNWIRED (2026-09-03): zero importers** |
+
+**UNWIRED means:** no file under `src/` imports it, and no file under `scripts/` or
+`tests/` reads it as a source-text fixture or dynamic import. Verified 2026-09-03 by
+import-graph scan of all `src/**/*.{js,jsx}` plus a filename-as-string sweep across
+`scripts/`, `tests/`, and every config file. These are staged components that were
+never connected to a route or parent — they are candidates for removal, not evidence
+of a broken feature. Removing one changes no behavior; delete the row here in the
+same commit. Do **not** assume the reverse: `ProtectedRoute.jsx`, `alertEngine.js`
+and `crdtSync.js` also have zero `src/` importers yet are load-bearing, because
+probes read them by path.
+
+### Finance & Comparison
+| Component | What It Does |
+|-----------|-------------|
+| `LedgerTable.jsx` | Virtualized guest transaction ledger table |
+| `LedgerStrip.jsx` | Compact ledger summary strip |
+| `CommissionsPanel.jsx` | Commission breakdown panel |
+| `EmployeeCompare.jsx` | Employee performance comparison |
+| `ChannelRevenue.jsx` | Channel revenue comparison |
+| `CompareBars.jsx` | Period-over-period delta bars |
+| `CompareCard.jsx` | Period comparison cards |
+
+### Executive UI (src/components/ui-exec/)
+| Component | What It Does |
+|-----------|-------------|
+| `Card.jsx` | Executive-styled card container |
+| `KpiCard.jsx` | KPI metric display with count-up animation |
+| `RangePicker.jsx` | Date range picker — **UNWIRED (2026-09-03): zero importers.** The date range in use comes from `GlobalControlBar.jsx`. The four `scripts/` hits on this filename are comments and one string literal, not a fixture read. |
+| `StatusBadge.jsx` | Status indicator badge |
+
+---
+
+
+# 7. GETTING DATA OUT (Owner-facing export + fast filters)
+
+> [!IMPORTANT]
+> `src/lib/exportData.js` is the **only** download implementation in the app. There is
+> no second one. `hotel.js#downloadCsv` and `hotel.js#downloadExcel` were deleted on
+> 2026-08-20 once the last page migrated — do not reintroduce them, and do not add a
+> per-page CSV writer. Two implementations of a download cannot be kept in agreement
+> by review: the negative-number guard fix and the Excel column spec would each have
+> had to be applied twice.
+
+## 7.1 The five export surfaces
+
+| Page | Rows exported | Column spec |
+|------|---------------|-------------|
+| `AuditLog.jsx` | Filtered + sorted audit rows | `AUDIT_EXPORT_COLUMNS` (`auditView.js`) — 19 columns covering all 13 fields the writers persist |
+| `Transactions.jsx` | `visible` (the filtered ledger) | `TRANSACTION_EXPORT_COLUMNS` — 13 columns, owner-facing labels |
+| `Statistics.jsx` | The snapshot rows | `STATISTICS_EXPORT_COLUMNS` — includes `original_value` as "As imported" |
+| `ManualEntry.jsx` | The spreadsheet grid | Derived from `config.fields`, so headers match the on-screen grid |
+| `ChartBuilder.jsx` | The aggregated groups | Derived from the table header expressions `{g}` and `` `${agg} (${v})` `` |
+
+Every one is `(isExcel ? downloadExcel : downloadCsv)(rows, { filename, columns, sheetName })`.
+Both return the row count and both **throw** on an empty set.
+
+There is a sixth download — the whole-database archive in `dbArchive.js` (section 7.6) —
+which is deliberately **not** in the table above. These five export a *filtered, columnar
+view for a human to read*; the archive serialises *raw storage for a machine to restore*.
+Giving the archive a column spec would silently drop any field not named in it, which is
+defect 1 below reintroduced at the one place it would be unrecoverable.
+
+## 7.2 The contract, and the four defects it closes
+
+```js
+downloadCsv(rows, { filename, columns, bom = true })   // -> row count, throws if empty
+downloadExcel(rows, { filename, columns, sheetName })  // -> row count, throws if empty
+buildCsv(rows, { columns, bom })                       // pure, testable
+buildSheetRows(rows, { columns })                      // pure, testable
+```
+
+1. **Silent column loss.** `Object.keys(rows[0])` decided the columns for the whole
+   file. Audit, transaction and payroll rows are heterogeneous — `device` is absent on
+   server-side events, `employee_id` on non-payroll charges. If row 0 lacked a field,
+   that column vanished for every row that had it, with no error and no count. An
+   export that quietly drops a column is worse than one that fails, because the
+   recipient reconciles against it.
+2. **Silent empty export.** A filter matching nothing produced a header-only download
+   and no message — indistinguishable from a browser blocking the download. Both
+   functions now throw, and every call site reports through that page's existing
+   feedback channel (`toast`, or `setSaveMsg`/`setMsgTone` on ManualEntry).
+3. **No UTF-8 BOM, LF endings.** Excel on Windows read a BOM-less UTF-8 CSV as the
+   local ANSI code page, so "Nuñez" arrived as "NuÃ±ez". Now BOM + CRLF per RFC 4180.
+4. **Blob URL revoked on the same tick as `.click()`**, racing the browser's own fetch
+   of that URL, and an anchor never attached to the document.
+
+## 7.3 The formula-injection guard, and the bug the guard itself caused
+
+Cells beginning `= + - @ tab CR` are prefixed with `'` via
+`securityUtils.js#neutralizeFormula`, so a payload like `-2+3+cmd|' /C calc'!A0`
+imported from a hostile CSV cannot execute when the owner opens the export.
+
+> [!CAUTION]
+> Applied naively, that rule prefixes **every negative amount**. `-25.50` exported as
+> the text `'-25.50`, and a refund column of text cannot be summed — silently, with no
+> error, in a file an accountant reconciles against. This defect was introduced and
+> caught inside the same session.
+
+The fix is an exemption for values that are plain decimal numbers:
+
+```js
+const NUMERIC_TEXT = /^-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+const guarded = NUMERIC_TEXT.test(raw) ? raw : neutralizeFormula(raw);
+```
+
+> [!TIP]
+> **BEST OUTCOME NOTE.** No formula or DDE payload is *also* a valid plain decimal, so
+> the exemption gives up nothing. The alternative — a list of "numeric columns" to skip
+> — would need updating every time a column is added, and would fail silently when
+> someone forgot. This rule needs no list to keep in sync. Verified both directions in
+> `probe-export-data.mjs` §4b: `-25.5`, `-1234.56`, `-1.2e3`, `.5` pass through as
+> numbers; `-2+3`, `- 1`, `+1`, `-1,000`, `-$5`, `=-1` are all still guarded.
+
+In Excel the same rule keeps numbers as **numbers**: `excelCell` coerces numeric text
+with `Number()` so the cell is right-aligned and summable, rather than a text cell that
+looks like a number.
+
+## 7.4 Fast filters: what the owner does not have to redo
+
+`exportData.js` also owns the date-filter layer, because a filter and an export of that
+filter must agree about what "this month" means.
+
+- `QUICK_RANGES` / `resolveQuickRange` — Today, Yesterday, This week, This month, Last
+  month, This quarter, YTD, Last 7/30/90 days.
+- `readStoredFilters` / `writeStoredFilters` / `clearStoredFilters` — the dashboard
+  reopens where the owner left it.
+- `describeRange` — the active range is rendered next to the total, so **a subtotal is
+  never read as a total**. Covered by `probe-export-data.mjs` §8.
+- `countUndated` — rows with no date are counted and shown, not dropped. A date filter
+  that silently discards undated rows makes the total disagree with the unfiltered view
+  for a reason the owner cannot see.
+
+> [!WARNING]
+> **Every date here derives from LOCAL calendar parts, never `toISOString()`.** The
+> repo's timezone is America/New_York, so `new Date().toISOString().slice(0,10)`
+> returns **tomorrow's** date after 8pm — a "Today" filter that hides the evening
+> shift's own events, precisely when a night-audit clerk is looking at them.
+>
+> Same trap, different symptom: `new Date("YYYY-MM-DD")` parses as **UTC midnight**, so
+> formatting it locally names the **previous** day. Use `hotel.js#formatDayLabel` for
+> any date-only string; never construct a `Date` from one to make a label.
+
+## 7.5 Bundle note
+
+Deleting `downloadExcel` from `hotel.js` also removed `import * as XLSX` from it. `xlsx`
+is the largest dependency in the bundle and `hotel.js` is imported by nearly every
+page, so it was being pulled into almost every route. It now loads only with the export
+module that uses it.
+
+## 7.6 The whole-database archive — the only backup that exists
+
+Added 2026-08-24: `src/lib/dbArchive.js`, a "Backup & restore" card in `Settings.jsx`, and
+a shared `downloadBlob()` lifted into `exportData.js`. Proved by
+`scripts/probe-db-archive.mjs` (216 assertions, 9 sections). No protected file was touched.
+
+The entire hotel database lives only in this browser's IndexedDB. Clearing site data
+destroyed everything, with no recovery path of any kind. This card is the whole recovery
+story — treat it accordingly.
+
+> [!CAUTION]
+> **A backup that only walks Dexie loses real money configuration.** The archive carries
+> **three** layers, and the third is the one every reasonable implementation forgets:
+> `stores` (Dexie tables), `secure_slots` (decrypted `secureStore` values), and
+> `local_slots` (plain `localStorage` strings). Hand-entered money settings live in
+> *plain* localStorage — `rri_commission_rates_v2`, `rri_cc_fee_rate`,
+> `rri_cc_fee_refunds_v1`, `rri_tax_config_v1`, `rri_tax_settings_v1`,
+> `rri_alert_thresholds`, `rri_revenue_thresholds`, `rri_pricing_config`,
+> `rri_weather_config`, `rri_housekeeping_config_<propId>`, `rri_filters_<page>`,
+> `rri_automationRules`, `rri_reportHistory` — plus `manual_draft_<propId>_<reportType>`,
+> which carries **no `rri_` prefix at all**. `LOCAL_SLOT_PREFIXES` must keep both
+> prefixes. Dropping this layer produces 8 probe FAILs naming every lost setting.
+
+**Encrypted slots travel DECRYPTED, on purpose.** `getOrGenerateCryptoKey()` creates a
+**non-extractable** AES-GCM key in a separate IndexedDB, so ciphertext copied to another
+machine can never be opened again — a backup of `rri_enc_*` blobs is not a backup. Only
+`rri_import_sessions` is a secure slot worth carrying (`SECURE_SLOT_KEYS`), and the probe
+asserts the literal string `rri_enc_` never appears in the archive. Three keys can never
+be found by a localStorage prefix scan and must be named explicitly if ever needed:
+`rr_local_session` and `rri_rate_limits_v1` are `secureStore` slots (persisted as
+`rri_enc_*`), and `rri_csrf_token` lives in **sessionStorage**.
+
+**Restore invariants.**
+
+- All 29 archived stores have **inbound** primary keys (28× `++id`, `IdSequence` on
+  `prefix`). That is what lets one uniform `bulkPut(rows)` preserve ids and every
+  cross-store reference. §3 asserts `schema.primKey.keyPath !== null` for every store; an
+  outbound key reads as `null`.
+- `LocalSession` and `PasswordResetRequest` are excluded deliberately — they are
+  credentials, not data.
+- Restore is **ONE** `localDb.transaction("rw", ...)` doing clear + bulkPut across all
+  stores, so a partial failure rolls back whole. Per-store transactions instead of one
+  produces a probe FAIL reading `Property: length 2 vs 1` — a half-failed restore that had
+  already destroyed a row. localStorage and secureStore writes happen only **after** the
+  Dexie commit, because a non-Dexie `await` inside the transaction breaks the zone.
+- **The audit entry for a restore is written AFTER the restore**, not before. The AuditLog
+  table has just been replaced by the backup's rows, so an entry written first is erased by
+  the very action it records. A byte-faithful restore keeps `verifyAuditChain()` green
+  because the chain tip is read from the table itself.
+
+**Known characteristic, not a defect:** `serializeArchive` uses
+`JSON.stringify(archive, null, 2)`, so 40k–100k transaction rows produce tens of MB,
+roughly doubled by the indentation (cap 300 MB). The indentation is deliberate — opening
+the file in a text editor is a legitimate recovery path.
+
+> [!WARNING]
+> `src/lib/uploadGuard.js`'s `ALLOWED_EXT = /\.(csv|xlsx|xls)$/i` must **NOT** be widened
+> to admit `.json` to make restore work. The archive file input is its own
+> `<input accept>` and never passes through the upload gate. §9 asserts this.
+
+---
+
+# 16. PAGE PERIOD COHERENCE (a page must describe the span it measures)
+
+Added 2026-08-24 after `MonthlyCalendar.jsx` was found describing one month while its KPIs
+measured 214 days. This section exists because the defect is a *class*, not an incident:
+any page that renders both a period **label** and period **KPIs** can drift apart, and the
+drift is invisible in code review because each half is correct on its own.
+
+## 16.1 The rule
+
+**Derive the label from the same source the KPIs aggregate.** The KPIs aggregate
+`dateRange`. Therefore the header, the grid count, the card titles and the empty-state
+notice must all derive from `dateRange` too — never from `month`/`year` alone.
+
+`src/lib/calendarGrids.js` is that derivation for calendar pages:
+
+```js
+calendarMonths({ period, months, year, dateRange })  // -> [{ year, month }, ...] UNCAPPED
+monthsInRange(from, to)                              // every {year, month} an ISO range touches
+daysInMonth(year, month)                             // numeric construction, no string parsing
+MAX_GRIDS = 24                                       // render cap; surplus must be STATED
+```
+
+The old inline expression was:
+
+```js
+const isMultiMonth = period === "monthly" && months.length > 1;
+```
+
+false for ytd, yearly, quarterly, weekly, daily **and** custom — so six of seven periods
+drew exactly ONE grid. The live site showed a header reading "for August 2026" above one
+August grid, over KPI cards summing all 214 imported days. YTD now draws 8 grids, not 1.
+
+## 16.2 Two traps inside that derivation
+
+**The year must travel with the month.** A weekly or custom range straddles a year
+boundary. The old single `calYear` made Dec 2025 – Jan 2026 render as two grids *both*
+titled 2026, and `key={grid.month}` collided between them. The probe asserts `calYear`
+never returns.
+
+**`monthly` is the ONE period where `months[]` stays authoritative over the range.**
+`computeRangeFromMonths()` in `useGlobalFilters.jsx` turns a non-contiguous pick
+(April + July) into a **contiguous** range (Apr 1 – Jul 31), while the row filter keeps
+only the picked months. Deriving grids from the range there would draw empty May and June
+grids the owner never selected — mutation-tested: removing that branch yields 4 grids
+instead of 2.
+
+## 16.3 Never cap silently
+
+Rendering is capped at `MAX_GRIDS` and the surplus is reported in an amber notice. A
+silent cap recreates the original defect exactly: a page showing fewer months than it
+measures.
+
+## 16.4 The non-calendar pattern
+
+`Expenses.jsx:118` is the correct shape for a page with no grid: picked month names when
+`period === "monthly"`, otherwise the raw `from → to`. Copy that, not the old calendar.
+
+## 16.5 Three numbers, three measures, one page
+
+The same fix closed a second defect worth generalising. Calendar cells were coloured by
+`room_revenue` against the thresholds the card subtitle prints, but `getRevenueGroup()`
+classified by `total_revenue` and the day modal displayed it. **The CSV importer never
+writes `total_revenue`** (0 of 214 parsed rows — see BRAIN_FINANCE.md 12.8), so every
+imported day was grouped "low" while its cell was painted green, and tapping a $12,000
+cell opened a panel reading $0.00.
+
+> [!TIP]
+> **BEST OUTCOME NOTE.** When a page shows a value three ways — a colour, a KPI and a
+> detail panel — assert that all three read the **same field**, not merely that each one
+> renders. All three were individually "working". Proved by
+> `scripts/probe-monthly-calendar.mjs` (67 assertions, 6 sections); reproduction measured
+> **53 PASS / 11 FAIL** against the unedited page before any fix was written.
+
+The KPI is now labelled **"Total Room Revenue"** precisely so nobody compares it against
+the Dashboard's $1,020,598.17 ledger total. The $9,339.50 difference is real ancillary
+income, not a bug — BRAIN_FINANCE.md 12.6.
+
+## 16.6 The same two defects, on a second page
+
+`MtdGrowth.jsx` carried both failure modes 16.5 describes, independently discovered
+(tracker #45, #46 — full write-up in BRAIN_TROUBLESHOOTING.md 27).
+
+Its headline card was keyed on the same never-written `total_revenue`, so it read **$0** and
+the Owner's Snapshot narrated *"Revenue is up 0.0% to $0"* in prose. And it violated 16.1
+in the comparison direction: the header printed the **full** prior period while the numbers
+beneath it were computed over a window truncated to the elapsed day count. Two spans, one
+label.
+
+> [!IMPORTANT]
+> **A period label is not the only thing that must match the measurement — so must the
+> comparison window.** `compareDateRange` is the full prior period by design
+> (`computeRange(comparePeriod, compareYear, …)`), so any page comparing "so far this
+> period" against it *must* truncate, *and must say so*. The page now derives
+> `prevWindow` and prints that in both places a range is shown.
+
+The truncation itself was the bug that mattered. It was computed as
+`prevToDate.setDate(prevFrom.getDate() + elapsedDays - 1)` — a UTC-midnight parse read
+through local calendar accessors — which lost a day in the owner's zone and **inflated
+every growth percentage on the page**. Date arithmetic on a `"YYYY-MM-DD"` key now goes
+through `hotel.js#isoEpochDay` / `#epochDayToIso`, which are built on `Date.UTC` and never
+consult the host calendar. `formatDayLabel` in the same file defuses the identical trap on
+the display side.
+
+> [!CAUTION]
+> **Do not reimplement either helper with a local accessor**, and do not trust a green
+> suite here: the defective expression is wrong in **2 of 8** probed windows under
+> `America/New_York` and wrong in **0 of 8** under `TZ=UTC`, so a UTC run exonerates it
+> completely. Every CI runner is UTC; an agent sandbox inherits `TZ` from its host and can
+> be either (BRAIN_TROUBLESHOOTING.md 27.2). `scripts/probe-mtd-growth.mjs` pins the zone
+> on its first executable line so the verdict does not depend on where it ran.
+
+---
+
+# 17. REACT-QUERY FETCH GATING (why 28 missing `enabled:` options are NOT a defect)
+
+Measured 2026-08-25: **40 `useQuery` calls across 12 files, 12 with `enabled:`, 8 with an
+explicit `staleTime`.** That reads like a bug report — 28 queries that fire before their
+inputs are ready — and it is not one. Anyone tempted to add `enabled:` to the other 28
+should read this section first, because the churn buys nothing and the reasoning is not
+visible from any single call site.
+
+## 17.1 The three properties that make it safe
+
+**One: no page component mounts until auth is resolved.** `RequireAuth` (`src/App.jsx:166`)
+wraps every route under `ProtectedRoutes`, and while `isLoadingAuth || !authChecked` it
+returns a full-screen spinner instead of `children`; if the check completes unauthenticated
+it returns `null`. So the ordinary "query fires with a half-initialised user" race cannot
+happen here — the query's component does not exist yet.
+
+**Two: no selection is a sentinel, not a hole.** With `selectedPropertyIds` defaulting to
+`[]` (`useGlobalFilters.jsx:143`), `effectiveProperties` is empty and `property` resolves to
+the string `"all"`. Consumers forward that to `db.entities.*.filter` as *no property
+condition*, and `applyScope` turns an absent condition into the caller's own allowance.
+`"all"` therefore means "all of mine", never "all that exist" — the data layer enforces it,
+not the hook. That is why an early fire returns correct data rather than empty or leaked
+data.
+
+**Three: every property-dependent key contains the property.** `["occupancy", from, to,
+propertyId, …]` and friends. If the roster resolves later and changes `effectiveProperties`,
+the key changes with it and react-query refetches on its own. The two keys that carry no
+property — `["uploads"]` and `["properties"]` — are portfolio-wide within the allowance by
+design, so there is nothing for a property switch to change.
+
+## 17.2 The failure mode this would be, if any one of the three were missing
+
+Worth writing down, because it is a real react-query trap and the next reader will meet it
+somewhere else. `src/lib/query-client.js` sets `staleTime: 5000` **and
+`refetchOnWindowFocus: false`**, with no `refetchOnReconnect` override. Nothing in
+`AuthContext.jsx`, `App.jsx` or `main.jsx` clears or invalidates the cache when auth
+resolves — verified by grep, and **not one of the 40 query keys contains user identity or an
+auth-ready flag.**
+
+So *if* a query could fire while the allowance was still empty, it would cache `[]` under a
+key that never subsequently changes. Stale after 5s is not the same as refetched: with
+window-focus refetching off and no remount, no invalidation and no key change, that empty
+array would be served forever. The user would get a dashboard of zeros that a reload fixes
+and nothing else does — indistinguishable from "there is no data", which is the exact
+failure `useGlobalFilters.jsx:162-166` warns about in its own comment.
+
+The protection is property one, and it lives in a different file from all 40 call sites.
+**If anyone ever makes `RequireAuth` render `children` during loading — for a skeleton
+screen, say — this section becomes a live defect list and all 28 queries need `enabled:`.**
+That is the coupling to watch, not the missing option.
+
+## 17.3 What was checked and found clean
+
+`DataIntelligence.jsx:41` (`['data-files']`) reads a raw table with no property scope and
+says so in a comment on the next line; it is one of the documented raw-access sites from the
+B4 sweep, and `:103` pulls `property` from `useGlobalFilters` for display. Not a defect.
+`useUploads` and `useProperties` are property-agnostic on purpose. No code change was made
+for any of this, deliberately.
+
+## 18. Clerk Audit drawer width
+
+The selected-clerk audit drawer is anchored to the right of the viewport but is resizable
+from its left edge. Dragging left gives the owner more room for folio evidence and refund
+classification; dragging right makes the panel narrower. Arrow Left and Arrow Right work on
+the focused resize handle. Width is clamped to a readable minimum and the available viewport,
+so it cannot be dragged off-screen. Each refund row wraps — rather than truncates — its full
+classification explanation and every available imported evidence field (remarks, refund code,
+payment detail, reason code, and charge type). If the source record itself contains only a
+short value, the UI states that limitation instead of inventing a fuller note.
+
+## 19. Two design systems, and the shadow hint that decides whether depth renders
+
+There are two component layers and they are not interchangeable. `src/components/ui/*` is
+the stock shadcn set; it sets `focus-visible:outline-none` and owns its own focus styling.
+`src/components/ui-exec/*` is the executive layer — `Button`, `Input`, `Select`,
+`SegmentedControl`, `Card`, `KpiCard` — and it is what Dashboard, Statistics, Transactions
+and Payroll use for controls and surfaces. Do not mix the two inside those four pages: the
+focus contract differs, and a stock control dropped in loses the outline the exec layer
+depends on.
+
+**The depth system.** Raised things (a `Button`, the selected `SegmentedControl` pill) carry
+`shadow-[shadow:var(--bevel-raised),var(--elev-1)]`. Sunken things (`Input`, `Select`, the
+`SegmentedControl` track) carry `shadow-[shadow:var(--well-inset),inset_0_0_0_1px_var(--line)]`.
+The tokens live in `src/index.css`.
+
+**The trap, which was a live defect.** A bare `var()` inside a Tailwind arbitrary shadow —
+`shadow-[var(--bevel-raised)]` — does not compile to a `box-shadow`. Tailwind reads it as a
+shadow *colour* and emits `--tw-shadow-color` with no shadow at all, so the surface renders
+perfectly flat and nothing errors. The `shadow:` type hint is what forces the box-shadow
+branch. `Card` and `KpiCard` shipped the bare form for a while and were flat on screen while
+every grep-based gate stayed green. `scripts/verify-ui-exec-gates.mjs` exists because of
+this: 16 checks over the exec layer covering shadow-hint recurrence, `transition-all`, stray
+hex literals in the four primitives, and focus suppression. It reads source, not compiled
+CSS — so it catches the bare-`var()` spelling, not a general CSS regression.
+
+**Focus is a floor, not a per-component style.** No exec primitive sets
+`focus-visible:outline-none`. They all inherit the global
+`:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px }` in `src/index.css`
+(`--brand` resolves to `rgb(0,224,150)`). This is deliberate: a 1px `focus:border-*`
+substitute fails WCAG 2.4.13 on thickness. Adding an outline suppressor to any exec control
+silently removes its keyboard affordance, which is why the gate checks for it.
+
+**Two behaviours worth knowing before you edit.** `Button` defaults to `type="button"`, so
+dropping one into a future `<form>` will not submit it — set `type="submit"` explicitly.
+`SegmentedControl` guards its handler (`if (!selected) onChange(...)`), so re-clicking the
+already-active segment fires nothing; every current call site is a plain `useState` setter,
+which React bails on anyway, but a handler with side effects on re-selection would not run.
+`SegmentedControl` uses `role="group"` with `aria-pressed`, not `tablist`/`radiogroup`,
+because it does not implement roving arrow-key focus — do not relabel the role without
+adding that keyboard model.
+
+`Input` and `Select` pass the raw DOM event to `onChange`; the 60-plus existing handlers read
+`e.target.value` / `e.target.checked` and depend on that.
+
+## 20. Post-login landing route: why `/dashboard` is an alias, not a destination
+
+The Dashboard is mounted at `/`. There has never been a `/dashboard` route. But
+`safeReturnTo()` in `src/lib/authReturnTo.js` returned `"/dashboard"` as its no-parameter
+default, so **any** login without a `?returnTo=` query — the ordinary case — handed the
+router a path nothing matched. The user authenticated successfully and landed on the
+catch-all instead of the scoreboard. The failure looked like a broken app rather than a
+broken constant, which is why it survived: the login itself worked, the redirect worked, and
+the only wrong thing was the string.
+
+Two changes hold the fix, and both are needed:
+
+1. `safeReturnTo()` now defaults to `"/"`. This is the actual correction — the function's job
+   is to name a real destination, and it was naming a fictional one. Everything else in that
+   function (same-origin enforcement, the single-leading-slash normalisation that rejects
+   `//host` and backslash tricks) is unchanged; it is an open-redirect guard and must stay
+   that way.
+2. `src/App.jsx` maps `/dashboard` to `<Navigate to="/" replace />`, declared **before** the
+   `/*` catch-all. This is for recovery, not for routing: old bookmarks, links in previously
+   sent email, and any stale client still holding the old default all resolve instead of
+   dead-ending. It is deliberately an exact-path alias rather than a broadened catch-all,
+   because making unknown URLs redirect to the Dashboard would hide genuine 404s — a
+   mistyped route would silently look like a working one.
+
+Regression coverage: `src/lib/authReturnTo.test.js` pins the default and the open-redirect
+rejections; `src/App.routing.test.jsx` pins that `/dashboard` renders the Dashboard via the
+alias and that an unknown path does **not**. `src/pages/Login.test.jsx` had hard-coded the
+old `/dashboard` string in both its `safeReturnTo` mock and its post-submit assertion, so
+those track the new default — the assertion is still an exact equality, not a loosened one.
+
+If you ever add a real page at `/dashboard`, delete the alias in the same commit. An alias
+and a route at the same path is a silent shadowing bug: the alias is declared first, so the
+real page would never render.
+
+---
+
+## 54. Payroll Realtime Synchronization and Property Scoping (2026-09-06)
+
+1. **Realtime Invalidation**:
+   `src/pages/Payroll.jsx` subscribes to realtime cross-tab and cross-window entity change notifications via `useRealtimeInvalidation(["staff", "payroll"])`.
+   In `src/lib/realtime.js`, table prefix matching is case-insensitive (`String(msg.table).toLowerCase().startsWith(prefix)`), ensuring changes to the `"Staff"` and `"PayrollRun"` Dexie/D1 tables immediately invalidate React Query caches across open tabs/windows without manual reload.
+   `invalidateQueries` passes normalized array keys (`Array.isArray(p) ? p : [p]`) so TanStack Query v5 properly invalidates prefix matching queries.
+
+2. **Property-Scoped Staff Query**:
+   `useStaff(propertyId)` scopes staff roster retrieval to the active global property filter:
+   - When a specific property is selected, only staff assigned to that property plus account-global staff (`property_id === ""`) are returned.
+   - When "All Properties" (`"all"`) is selected, staff across all authorized properties and account-global staff are returned.
+   - Query key is `["staff", propertyId]` so changing the global property filter automatically updates the staff query.
+   - Staff creation (`Staff.create`) only mutates the `Staff` table and does NOT create or alter `TimecardPunch` records or clock shifts.
+
+Covered by probe `scripts/probe-payroll-staff-sync.mjs`.
+
+---
+
+## 55. Continuous Settings Cloud Sync and Cloudflare Quota Optimization (2026-09-08)
+
+Financial settings (taxes, OTA commission rates, CC processing fees, alert thresholds) are synchronized in real-time across all browser windows, tabs, and devices via Cloudflare D1 with high-performance edge caching:
+
+1. **Edge-Level ETag Conditional 304 Caching**:
+   `pullRemoteSettings()` in `src/lib/settingsStore.js` includes `If-None-Match: <etag>` on every poll. The Cloudflare Worker evaluates the revision header before executing any D1 read queries. When settings have not changed, the Worker returns HTTP `304 Not Modified` with zero body bytes, cutting D1 database read queries by >99% and consuming 0 subrequests.
+
+2. **Cross-Tab BroadcastChannel & Storage Event Bus**:
+   `src/lib/settingsBus.js` uses `BroadcastChannel('rri_settings_bus')` in tandem with the browser `storage` event to achieve sub-millisecond (<0.5ms) cross-tab reactivity within the same browser profile. Updating settings in Tab A immediately triggers in-memory React re-computation in Tab B without DOM remounts.
+
+3. **Single-Tab Leader Election & Adaptive Polling**:
+   `src/lib/realtime.js` coordinates tab leadership so only one active tab interacts with Cloudflare. Polling pauses when `document.hidden` is true, and window `focus` / document `visibilitychange` listeners trigger immediate conditional re-validation when an operator returns to the screen.
+
+4. **Input-State Editing Lock**:
+   `setEditingSettingsLock(true)` in `src/lib/settingsStore.js` is triggered via `onFocusCapture` in `src/pages/Settings.jsx`. Background sync polls are suppressed while an operator is actively editing inputs, preventing remote overwriting of keystrokes.
+
+5. **Compare-And-Swap (CAS) Concurrency**:
+   Setting mutations submit `expected_revision`. The Worker rejects stale updates with HTTP 409 Conflict if a newer remote revision exists, prompting non-destructive re-pull instead of silent overwrite.
+
+6. **Downstream Financial Recalculation**:
+   Updates to settings trigger automatic cache invalidation of financial queries (`payments`, `sources`, `occupancy`, `gross`, `daily-aggregates`) and schedule an asynchronous rebuild of `DailyFinancialAggregate` in IndexedDB via `rebuildDailyAggregates({ propertyId: "all" })`, guaranteeing 100% mathematical consistency across all devices.
+
+---
+
+## 56. Explicit Report Replacement Flow & Server Archive Resume (2026-09-24)
+
+When uploading or resuming reports that overlap an active analytical period for the property (e.g. `Hotel Statistics.csv` or `Source Summary (1).csv`), the application enforces financial ledger integrity and explicit lineage tracking:
+
+1. **Guarded Overlap Detection & Candidate Resolution**:
+   - When `/api/bulk-import/activate` encounters an active manifest covering the same report type and date range, the Worker returns HTTP 409 `IMPORT_REPLACEMENT_REQUIRED` along with `existing_bundle_id`, `existing_bundle` metadata, and candidate active manifests.
+   - `activateBundleOnServer` preserves this metadata and throws an enriched error with `code: 'IMPORT_REPLACEMENT_REQUIRED'`.
+
+2. **Explicit Report Replacement Dialog (`ReportReplacementDialog`)**:
+   - In `src/pages/Import.jsx`, catching `IMPORT_REPLACEMENT_REQUIRED` opens a dedicated Radix UI modal.
+   - The dialog presents the incoming version card (file name, report type, row count, date ranges) and radio-button selection of conflicting active report candidates (revision, active date ranges, row counts).
+   - Requires explicit operator choice; automatic silent replacement is strictly prohibited.
+
+3. **Zero-Device-Upload Server Archive Resume**:
+   - When server-archived originals await processing in R2 storage, `handleResumePending` downloads the original raw bytes via `downloadRawArchiveFromServer(archiveId)` and resumes processing.
+   - If an overlap conflict is encountered, `ReportReplacementDialog` opens with the banner: `⚡ Resuming safely from server storage. Zero device re-upload required.`
+   - Confirming replacement submits `supersedesBundleId` and `expectedRevision` to `executeBulkImport` and `activateBundleOnServer`.
+   - The backend marks the predecessor manifest as `superseded` and activates the new manifest atomically while keeping both raw archives 100% intact.
+   - Covered by `scripts/probe-bulk-import-replacement-flow.mjs` and `src/pages/ImportBatch18Regression.test.jsx`.
+
+4. **Multi-Report Predecessor Replacement (`many-to-one`)**:
+   - In `src/pages/Import.jsx`, when an incoming file overlaps multiple active reports (e.g. `Source Summary (1).csv` covering Jan 1 → Aug 2 overlapping three quarterly reports), `candidates` contains all active overlaps.
+   - The UI automatically selects all overlapping reports with interactive checkboxes and warns the user: `This incoming report covers the timeframe of N active reports. To avoid duplicate analytical records, all overlapping active reports must be superseded.`
+   - Confirming replacement submits `predecessors: [{ id, expected_revision }]` to `executeBulkImport`, which forwards to `activateBundleOnServer`.
+   - All predecessors are superseded atomically in D1, 0 duplicate analytical rows are stored, and Dexie hydration flushes old superseded rows while syncing the new active bundle.
+   - Tested in `src/pages/ImportBatch18Regression.test.jsx` and `scripts/probe-bulk-import-multi-replacement.mjs`.
+
+---
+
+## 57. Operational Integrity & Active Property Scope Contracts (2026-10-03)
+
+1. **RoomBoard Independent BoardDate & Multiday Stay Invariant**:
+   - `RoomBoard.jsx` queries stays and housekeeping tasks scoped directly to selected `boardDate` instead of inheriting the global period `dateRange`/`months`.
+   - `useRoomStays` in `src/lib/useHotelData.js` evaluates stays overlapping `boardDate` (including `check_in` before `boardDate` and `check_out` after `boardDate`), so narrowing date to `boardDate` does not drop multiday stays.
+   - Housekeeping tasks query for `boardDate`.
+   - All query loading states (`isLoading`, `roomsLoading`, `staysQ.isLoading`, `tasksQ.isLoading`) are checked before rendering, preventing false vacant availability during reads.
+   - Fetch failures render `ErrorState` with retry, never vacant availability.
+
+2. **RoomBoard Check-in Form Date Tracking (`newIn`)**:
+   - `effectiveCheckIn` follows `boardDate` automatically while the operator has not explicitly selected a custom check-in date.
+   - Once manually edited, the explicit manual date is preserved across subsequent `boardDate` changes.
+   - Changing properties (`singlePropertyId`) or completing a check-in resets form fields and reverts to the automatic `boardDate` default.
+
+3. **Active Property Scope & Zero-Selection Guard (`useGlobalFilters`)**:
+   - `accessibleProperties` / `properties` in `useGlobalFilters.jsx` filters `p.active !== false` alongside `canAccessProperty(p.id)`, hiding inactive properties from dashboards, pickers, and comparisons.
+   - Global `useProperties()` in `src/lib/useHotelData.js` remains unfiltered so Settings roster can display inactive properties and support reactivation.
+   - Zero selection / portfolio mode forwards an explicit array of active portfolio IDs (`activePortfolioIds`), never the unscoped `"all"` sentinel.
+   - Zero active properties yields an empty array `[]` (never `"all"`), and `buildFilter` generates `{ property_id: { $in: [] } }` returning 0 records without leaking inactive data.
+   - Cached selections of properties that become inactive are dropped by `effectiveProperties`.
+
+4. **Fail-Closed Portfolio Aggregates (`useDailyFinancialAggregates`)**:
+   - Gated to single properties (`typeof propertyId === 'string' && propertyId !== 'all'`).
+   - Portfolio scopes (arrays, `"all"`, empty array, null) return `data: null`, forcing callers to query property-scoped raw ledgers and preventing partial-portfolio totals from incomplete cache rows. Single-property queries use dedicated namespaced cache keys.
+
+---
+
+## 58. Tailwind CSS v4 Engine Migration & Dependency Security Contract (2026-10-03)
+
+1. **Tailwind CSS v4 & LightningCSS Pipeline Integration**:
+   - Modernized styling pipeline to `tailwindcss@4.3.3` with `@tailwindcss/postcss@4.3.3`.
+   - `postcss.config.js` configures `@tailwindcss/postcss: {}`.
+   - Redundant `autoprefixer` removed; Tailwind 4 integrates native LightningCSS autoprefixing and modern vendor prefixes.
+   - `src/index.css` replaces legacy `@tailwind` directives with modern `@import "tailwindcss";`, `@config "../tailwind.config.js";`, `@custom-variant dark (&:where(.dark, .dark *));`, theme token mappings (`--default-ring-width`, `--default-ring-color`, `--radius-full`, `--color-slate-200`, `--color-blue-500`), legacy outline compatibility rules, and base border-color resets.
+   - Legacy JavaScript Tailwind config (`tailwind.config.js`) and plugins (`tailwindcss-animate`) remain fully preserved and loaded via `@config "../tailwind.config.js"`.
+   - The compatibility layer preserves the v3 defaults covered by the fixture assertions, including border widths, heading font sizes/weights, list reset, and default border colors.
+
+2. **Security Gate & Dependency Hygiene**:
+   - `dompurify` upgraded from vulnerable `^3.4.13` to patched `^3.4.16`, deduplicated across all runtime and bundle dependencies (including `jspdf`).
+   - Vulnerable `braces` removed from the dependency tree (previously introduced via Tailwind v3 chokidar/micromatch watch pipeline). `npm ls braces` returns empty.
+   - Security audit gate (`node scripts/audit-gate.mjs`) passes with 0 critical, 0 high, 0 moderate, 0 low advisories without relaxing policy or expanding allowlists (`ACCEPTED = {}` unchanged).
+
+3. **Chromium Computed Style Proof & Buffer Equivalence**:
+   - Validated across 68 automated style assertions in headless Chromium against frozen v3 baseline.
+   - The covered dark/light tokens, interactive controls, overlays/dialog animations, preflight resets, utility scales, and elevation/hairlines pass all 68 assertions. This fixture does not establish parity for every page or browser.
+   - Primary interactive button focus ring screenshot buffers are byte-identical (1719 bytes each, `Buffer.compare === 0`).
+
+
+4. **PDF Modern Color Compatibility**:
+   - `html2canvas` is pinned to the NPM alias `npm:html2canvas-pro@2.5.0`, preserving the existing import and call options in `src/lib/pdfExport.js` and its pagination contract. The maintained renderer supports Tailwind modern color functions; no custom color conversion is used.
+   - The normal authenticated synthetic Dashboard PDF download now parses and renders populated pages. Independent page-one pixel review confirms full $24,525.00, 75, 68.2%, $327.00, RevPAR $222.95, and partial/tax-incomplete warnings. Larger-value and full-page visual acceptance remain separate pending work; this does not establish production acceptance.
+   - `--color-blue-500` is explicitly declared with the installed Tailwind 4.3.3 default value `oklch(62.3% 0.214 259.815)`, preserving its computed color and satisfying the surface token declaration contract.
+   - PDF capture now clears overflow clipping and ellipsis only on numerical `.u-figure.truncate` nodes in the cloned document. The actual `exportToPdf` callback contract preserves full text, live DOM, unrelated nodes, and existing errors; eight synthetic assertions are separate from the observed normal-value first-page pixel proof. Larger-value and full-page acceptance remain pending.
+
+5. **Money Kept Warning Boundaries**:
+   - The donut warning about deductions exceeding gross now requires strictly negative money kept. No warning appears for an empty period or positive break-even; a loss still warns. Three real component render assertions reproduce the two old false warnings and pass with the corrected guard. Financial calculations and tax completeness remain unchanged.
+
+6. **Empty Property Selection in Local Page Queries**:
+   - Payroll payroll/occupancy queries, Expenses expense/payroll queries, and Forecasting's shared page filter preserve an explicit empty array as `property_id: { $in: [] }`. Single selections, nonempty arrays, legacy `all`/undefined behavior, date constraints, and Staff filtering stay unchanged.
+   - `src/pages/portfolioQuery.test.js` executes current page query functions against the unchanged local facade with synthetic owner/restricted identities and in-memory IndexedDB. This is client query coverage; normal authenticated browser/server acceptance remains separate.
+
+
+## Cross-site UX production integration (October 4, 2026)
+
+The production integration applies the cross-site UX patch onto the current-main-based
+owner reporting candidate. It preserves lazy startup and the current enterprise/property
+contracts while adding mobile all-pages navigation, accessible bounded dialogs, date
+controls, complete loading/error states, duplicate-save guards, truthful missing values,
+and clearer export/account actions. Command menu changes live in
+`src/components/CommandMenuDialog.jsx`; weather resolves a single selected property
+through the existing property selection helper.
+
+The owner reported verification complete and authorized release. The exact integrated
+source is newly assembled; that statement is not an independent acceptance result for
+the combined source. See `ANTIGRAVITY_UI_UX_HANDOFF.md` for changed-file inventory,
+commands, expected behavior and remaining runtime risks. Broad tests and browser
+acceptance remain delegated to Antigravity. Packaging/deployment outcomes are recorded
+in `docs/production-ui-release-2026-10-04.md`.
+
+
+October 4 release follow-up: fixed the ledger ErrorState prop required by CI; preserved legacy review handling metrics while adding explicit provider-publication metrics; retained numeric-dollar channel payloads behind a verified-publishing capability and provider receipt requirement. The current mock adapter remains disabled. Antigravity: run npm run typecheck, node scripts/probe-reviews.mjs and node scripts/probe-cents-unit-mismatch.mjs, then inspect /Pricing, /Reviews and /DataIntelligence. Codex did not run these checks locally.
+
+
+Release continuation: updated existing DataIntelligence UI test code to await real asynchronous reads before asserting loaded content, with an initial pending-state assertion preserved. Updated SmartButtonGroup callback test to the actual Report Download Options label. No assertions removed, product loading guards unchanged, no verification commands executed locally. GitHub CI owns automatic execution; Antigravity owns authenticated owner acceptance. Production artifact is unchanged by these test-only edits.
